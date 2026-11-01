@@ -1,0 +1,20 @@
+# 大文件与可重建产物：一律不入库，见 CLAUDE.md 第 5 节
+_work/
+*.mkv
+*.mp4
+*.wav
+*.mp3
+*.raw
+*.deb
+*.tar.gz
+*.zip
+*.whl
+*.o
+__pycache__/
+# 宣传片的中间产物
+promo/rec/
+promo/dyh/
+promo/dyhttf/
+promo/dyh_cmap.json
+promo/prev_*.png
+promo/*_sheet.png

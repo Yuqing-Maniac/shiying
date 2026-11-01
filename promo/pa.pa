@@ -1,0 +1,4 @@
+load-module module-native-protocol-unix
+load-module module-null-sink sink_name=speaker
+set-default-sink speaker
+set-default-source speaker.monitor
