@@ -1,0 +1,51 @@
+# 拾影录屏：在 Releases 页面发布标签为 shiying-vX.Y.Z 的版本后，从零构建全部发布包并挂到该版本下
+name: shiying-release
+on:
+  release:
+    types: [published]
+  workflow_dispatch:   # 手动运行：只构建并上传构建产物，不挂到 Releases
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.event.release.tag_name, 'shiying-v')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      SY_WORK: ${{ github.workspace }}/_work
+    steps:
+      - uses: actions/checkout@v4
+      - name: 校验标签与版本号一致
+        if: github.event_name == 'release'
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          V=$(sed -n 's/^#define APP_VERSION "\(.*\)"/\1/p' src/path.h)
+          if [ "${TAG#shiying-v}" != "$V" ]; then
+            echo "标签 $TAG 与 src/path.h 的 APP_VERSION（$V）不一致，先通过 PR 更新版本号再发版" >&2; exit 1
+          fi
+      - name: 安装构建依赖
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q gcc binutils dpkg-dev python3-pip \
+            libx11-dev libxrandr-dev libfreetype-dev libfontconfig-dev libpulse-dev \
+            binutils-mingw-w64-x86-64
+          python3 -m pip install --user --break-system-packages ziglang==0.17.0
+      - name: 构建全部发布包
+        run: bash build/build_all.sh
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: shiying-dist
+          path: _work/dist/
+      - name: 挂到 Releases（ASCII 资产名＋中文显示名）
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          bash build/release_assets.sh
+          mapfile -t SPECS < _work/assets/upload.list
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber "${SPECS[@]}"
