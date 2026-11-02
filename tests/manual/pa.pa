@@ -1,0 +1,6 @@
+load-module module-native-protocol-unix
+load-module module-null-sink sink_name=speaker
+load-module module-null-sink sink_name=micsink
+load-module module-sine sink=micsink frequency=880
+set-default-sink speaker
+set-default-source micsink.monitor
