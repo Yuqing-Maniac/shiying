@@ -1,0 +1,235 @@
+# 每周清理 Actions 产物与缓存，避免共享存储被旧安装包和缓存占满。
+# 只删 artifact 与 cache。不删 workflow run，也不动 Release 资产。
+# 产物：expired，或 created_at 早于保留天数（定时任务为 7 天）。
+# 缓存：last_accessed_at（没有则用 created_at）早于保留天数。
+# 定时任务在周一 03:00 UTC 实际删除。手动运行默认只列出，不删除。
+name: actions-cleanup
+
+on:
+  schedule:
+    - cron: "0 3 * * 1"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "只列出将删除的项，不实际删除"
+        type: boolean
+        default: true
+      older_than_days:
+        description: "保留天数。产物看 created_at，缓存看 last_accessed_at"
+        type: number
+        default: 7
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: actions-cleanup
+  cancel-in-progress: false
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: 删除超过保留期的产物与缓存
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_PROMPT_DISABLED: "1"
+          REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_DRY_RUN: ${{ github.event.inputs.dry_run }}
+          INPUT_DAYS: ${{ github.event.inputs.older_than_days }}
+        run: |
+          set -euo pipefail
+
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            DRY_RUN=${INPUT_DRY_RUN:-true}
+            DAYS=${INPUT_DAYS:-7}
+          else
+            DRY_RUN=false
+            DAYS=7
+          fi
+
+          case "$DRY_RUN" in
+            true|false) ;;
+            *) echo "dry_run must be true or false, got: ${DRY_RUN}" >&2; exit 1 ;;
+          esac
+          case "$DAYS" in
+            ''|*[!0-9]*) echo "older_than_days must be an integer, got: ${DAYS}" >&2; exit 1 ;;
+          esac
+          if [ "$DAYS" -lt 1 ] || [ "$DAYS" -gt 3650 ]; then
+            echo "older_than_days must be 1..3650, got: ${DAYS}" >&2
+            exit 1
+          fi
+
+          cutoff=$(date -u -d "${DAYS} days ago" +%Y-%m-%dT%H:%M:%SZ)
+          echo "repo=${REPO} event=${EVENT_NAME} dry_run=${DRY_RUN} older_than_days=${DAYS} cutoff=${cutoff}"
+
+          tmp=$(mktemp -d)
+          trap 'rm -rf "$tmp"' EXIT
+
+          # 按页拉全量。不用 gh --paginate/--slurp：ubuntu-24.04 自带的 gh 2.45 没有 --slurp。
+          page_size=100
+          fetch_pages() {
+            local url=$1
+            local outfile=$2
+            local page=1
+            local sep=""
+            local body count
+            printf '[' > "$outfile"
+            while true; do
+              body=$(gh api "${url}&page=${page}")
+              count=$(jq '(.artifacts // .actions_caches // []) | length' <<<"$body")
+              printf '%s%s' "$sep" "$body" >> "$outfile"
+              sep=','
+              if [ "$count" -lt "$page_size" ]; then
+                break
+              fi
+              page=$((page + 1))
+              if [ "$page" -gt 100 ]; then
+                echo "too many pages: ${url}" >&2
+                exit 1
+              fi
+            done
+            printf ']\n' >> "$outfile"
+          }
+
+          fetch_pages "repos/${REPO}/actions/artifacts?per_page=${page_size}" "$tmp/artifacts.json"
+          fetch_pages "repos/${REPO}/actions/caches?per_page=${page_size}&sort=last_accessed_at&direction=asc" "$tmp/caches.json"
+
+          art_total=$(jq '[.[] | .artifacts[]?] | length' "$tmp/artifacts.json")
+          cache_total=$(jq '[.[] | .actions_caches[]?] | length' "$tmp/caches.json")
+
+          jq -r --arg cutoff "$cutoff" '
+            [
+              .[] | .artifacts[]?
+              | select(.expired == true or ((.created_at // "") < $cutoff))
+              | {
+                  id: (.id | tostring),
+                  name: ((.name // "") | gsub("[\\t\\r\\n]"; " ")),
+                  bytes: ((.size_in_bytes // 0) | floor | tostring),
+                  when: (.created_at // ""),
+                  extra: (if .expired == true then "expired" else "old" end)
+                }
+            ]
+            | sort_by(.when)
+            | .[]
+            | [.id, .name, .bytes, .when, .extra]
+            | @tsv
+          ' "$tmp/artifacts.json" > "$tmp/artifacts.tsv"
+
+          jq -r --arg cutoff "$cutoff" '
+            [
+              .[] | .actions_caches[]?
+              | (.last_accessed_at // .created_at // "") as $ts
+              | select($ts != "" and ($ts < $cutoff))
+              | {
+                  id: (.id | tostring),
+                  name: ((.key // "") | gsub("[\\t\\r\\n]"; " ")),
+                  bytes: ((.size_in_bytes // 0) | floor | tostring),
+                  when: $ts,
+                  extra: ((.ref // "") | gsub("[\\t\\r\\n]"; " "))
+                }
+            ]
+            | sort_by(.when)
+            | .[]
+            | [.id, .name, .bytes, .when, .extra]
+            | @tsv
+          ' "$tmp/caches.json" > "$tmp/caches.tsv"
+
+          delete_one() {
+            local kind=$1
+            local id=$2
+            local path err
+            case "$kind" in
+              artifact) path="repos/${REPO}/actions/artifacts/${id}" ;;
+              cache) path="repos/${REPO}/actions/caches/${id}" ;;
+              *) echo "unknown kind: ${kind}" >&2; return 1 ;;
+            esac
+            if [ "$DRY_RUN" = "true" ]; then
+              return 0
+            fi
+            if err=$(gh api --method DELETE "$path" 2>&1 >/dev/null); then
+              return 0
+            fi
+            if printf '%s\n' "$err" | grep -q '404'; then
+              return 0
+            fi
+            printf '%s\n' "$err" >&2
+            return 1
+          }
+
+          # Sets LIST_N, LIST_BYTES, LIST_FAILED.
+          process_list() {
+            local kind=$1
+            local file=$2
+            local id name size when extra
+            LIST_N=0
+            LIST_BYTES=0
+            LIST_FAILED=0
+            while IFS=$'\t' read -r id name size when extra || [ -n "${id:-}" ]; do
+              [ -n "${id:-}" ] || continue
+              case "$id" in
+                *[!0-9]*)
+                  echo "skip bad id kind=${kind} id=${id}" >&2
+                  LIST_FAILED=$((LIST_FAILED + 1))
+                  id=
+                  continue
+                  ;;
+              esac
+              case "$size" in
+                ''|*[!0-9]*) size=0 ;;
+              esac
+              LIST_N=$((LIST_N + 1))
+              LIST_BYTES=$((LIST_BYTES + size))
+              if [ "$DRY_RUN" = "true" ]; then
+                echo "dry-run ${kind} id=${id} bytes=${size} when=${when} extra=${extra} name=${name}"
+              elif delete_one "$kind" "$id"; then
+                echo "deleted ${kind} id=${id} bytes=${size} when=${when} extra=${extra} name=${name}"
+              else
+                echo "failed ${kind} id=${id} name=${name}" >&2
+                LIST_FAILED=$((LIST_FAILED + 1))
+              fi
+              id=
+            done < "$file"
+          }
+
+          bytes_human() {
+            awk -v b="$1" 'BEGIN {
+              split("B KiB MiB GiB TiB", u, " ")
+              i = 1
+              while (b >= 1024 && i < 5) { b /= 1024; i++ }
+              printf "%.1f %s", b, u[i]
+            }'
+          }
+
+          process_list artifact "$tmp/artifacts.tsv"
+          art_n=$LIST_N
+          art_bytes=$LIST_BYTES
+          art_failed=$LIST_FAILED
+
+          process_list cache "$tmp/caches.tsv"
+          cache_n=$LIST_N
+          cache_bytes=$LIST_BYTES
+          cache_failed=$LIST_FAILED
+
+          failed=$((art_failed + cache_failed))
+          art_human=$(bytes_human "$art_bytes")
+          cache_human=$(bytes_human "$cache_bytes")
+          echo "summary dry_run=${DRY_RUN} cutoff=${cutoff} scanned_artifacts=${art_total} matched_artifacts=${art_n} artifact_bytes=${art_bytes} artifact_bytes_human=${art_human} scanned_caches=${cache_total} matched_caches=${cache_n} cache_bytes=${cache_bytes} cache_bytes_human=${cache_human} delete_failures=${failed}"
+
+          if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+            mode="已删除"
+            [ "$DRY_RUN" = "true" ] && mode="试运行（未删除）"
+            {
+              echo "### actions-cleanup"
+              echo "- 模式：${mode}"
+              echo "- 截止：\`${cutoff}\`（早于 ${DAYS} 天）"
+              echo "- 产物：命中 ${art_n} / 扫描 ${art_total}，${art_human}（${art_bytes} bytes）"
+              echo "- 缓存：命中 ${cache_n} / 扫描 ${cache_total}，${cache_human}（${cache_bytes} bytes）"
+              echo "- 删除失败：${failed}"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          exit "$failed"

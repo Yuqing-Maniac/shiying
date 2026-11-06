@@ -3,7 +3,7 @@ name: shiying-release
 on:
   release:
     types: [published]
-  workflow_dispatch:   # 手动运行：只构建并上传构建产物，不挂到 Releases
+  workflow_dispatch:   # 手动运行：只构建，不挂到 Releases，也不上传 Actions artifact
 
 permissions:
   contents: write
@@ -35,11 +35,6 @@ jobs:
           python3 -m pip install --user --break-system-packages ziglang==0.17.0
       - name: 构建全部发布包
         run: bash build/build_all.sh
-      - name: 上传构建产物
-        uses: actions/upload-artifact@v4
-        with:
-          name: shiying-dist
-          path: _work/dist/
       - name: 挂到 Releases（ASCII 资产名＋中文显示名）
         if: github.event_name == 'release'
         env:
