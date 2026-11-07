@@ -11,11 +11,15 @@
 
 ## 支持平台
 
-| 系统 | 架构 | 发布包 |
+v1.1.0 的发布标签是 `shiying-v1.1.0`。这个版本只提供免安装包，以及校验文件 `SHA256SUMS.txt`。
+
+| 系统 | 架构 | 下载文件 |
 |---|---|---|
-| 银河麒麟桌面版 V10（飞腾等 arm64 机型），UKUI，X11 会话 | 飞腾 arm64（aarch64） | `拾影录屏_1.1.0_飞腾arm64_免安装.tar.gz`／`.zip`、`拾影录屏_1.1.0_飞腾arm64_安装包.deb` |
-| 同上，以及其他 glibc ≥ 2.17 的 X11 桌面 Linux | x86_64 | `拾影录屏_1.1.0_x86_64_免安装.tar.gz`／`.zip`、`拾影录屏_1.1.0_x86_64_安装包.deb` |
-| Windows 10 及以上（x86_64） | x86_64 | `拾影录屏_1.1.0_Windows_免安装.zip` |
+| 银河麒麟桌面版 V10（飞腾等 arm64 机型），UKUI，X11 会话 | 飞腾 arm64（aarch64） | `shiying_1.1.0_kylin_arm64_portable.tar.gz`、`shiying_1.1.0_kylin_arm64_portable.zip` |
+| 同上，以及其他 glibc ≥ 2.17 的 X11 桌面 Linux | x86_64 | `shiying_1.1.0_linux_x86_64_portable.tar.gz`、`shiying_1.1.0_linux_x86_64_portable.zip` |
+| Windows 10 及以上（x86_64） | x86_64 | `shiying_1.1.0_windows_x86_64_portable.zip` |
+
+下载用上表里的文件名。页面上的显示名是中文，例如 `拾影录屏_1.1.0_飞腾arm64_免安装.tar.gz`。`SHA256SUMS.txt` 按下载文件名记录 sha256。
 
 不支持 Wayland 会话（屏幕采集基于 X11）。麒麟上的声音需要 PulseAudio（麒麟 V10 默认具备），缺失时只能无声录制。Windows 包解压到本机磁盘后双击 `拾影录屏.exe`，不要在压缩包里直接运行。SmartScreen 与 `--check` 的说明在包内 `启动说明.txt`。
 
@@ -25,8 +29,6 @@
 1. 把压缩包解压到主目录下任意文件夹（不要在 U 盘或 NTFS 分区里直接运行）。
 2. 双击 `拾影录屏` 打开；需要开始菜单和桌面图标时，运行 `./安装到菜单.sh`（`sudo ./安装到菜单.sh --system` 为所有用户添加）。
 3. 卸载：运行 `./卸载.sh`，再删除文件夹。录好的视频不受影响。
-
-**安装版**：`sudo dpkg -i 拾影录屏_1.1.0_飞腾arm64_安装包.deb`，装到 `/opt/拾影录屏`，开始菜单出现“拾影录屏”；命令行可用 `拾影录屏` 或 `shiying`。
 
 **使用**
 - 点“开始录制”；停止后自动合并保存，默认保存到 `~/视频/录屏/录屏_日期_时间.mp4`。
@@ -41,9 +43,11 @@
 见 [CLAUDE.md](CLAUDE.md) 第 5 节。简要：
 
 ```
-bash build/build_all.sh      # 发布包输出到 _work/dist/
-bash tests/run_tests.sh      # 回归测试
+bash build/build_all.sh
+bash tests/run_tests.sh
 ```
+
+`build/build_all.sh` 把本地包写到 `_work/dist/`。拉取请求和向 `main` 推送时，`shiying-ci` 会编译、执行 `build/release.sh`，并运行 `tests/run_tests.sh`。
 
 ## 许可
 
