@@ -5,7 +5,7 @@
 
 #define APP_NAME    "拾影录屏"
 #define APP_ID      "shiying"
-#define APP_VERSION "1.1.0-test.2"
+#define APP_VERSION "1.1.0"
 
 extern char g_exe_dir[1024];
 extern char g_cache_dir[1024];
