@@ -58,7 +58,7 @@ static void plat_append_video(SySession *s, ArgBuf *a) {
     if (s->grab == GRAB_DDA) {
         ap(a, "-f"); ap(a, "lavfi");
         ap(a, "-i");
-        apf(a, "ddagrab=output_idx=%d:draw_mouse=%s:framerate=%d:video_size=%dx%d:offset_x=0:offset_y=0:output_fmt=bgra:dup_frames=1",
+        apf(a, "ddagrab=output_idx=%d:draw_mouse=%s:framerate=%d:video_size=%dx%d:offset_x=0:offset_y=0:output_fmt=bgra:dup_frames=1,hwdownload,format=bgra",
             mon_i, draw_flag(s), s->plan.fps, s->plan.w, s->plan.h);
     } else {
         ap(a, "-f"); ap(a, "gdigrab");
@@ -77,8 +77,8 @@ static int widen(const char *s, wchar_t *out, int n) {
 }
 
 static void append_arg(wchar_t *cmd, size_t cap, const char *arg) {
-    wchar_t w[1200];
-    if (widen(arg ? arg : "", w, 1200) != 0) return;
+    wchar_t w[ARG_L];
+    if (widen(arg ? arg : "", w, ARG_L) != 0) return;
     size_t len = wcslen(cmd);
     int quote = w[0] == 0 || wcschr(w, L' ') || wcschr(w, L'\t') || wcschr(w, L'"');
     if (len && len + 1 < cap) cmd[len++] = L' ';

@@ -3,7 +3,7 @@
 
 #include <stdio.h>
 
-#define APP_NAME    "拾影录屏"
+#define APP_NAME    "映刻录屏"
 #define APP_ID      "shiying"
 #define APP_VERSION "1.1.0"
 
@@ -18,6 +18,7 @@ void   logf_(const char *fmt, ...);
 int    mkdir_p(const char *path);
 const char *home_dir(void);
 void   file_fsync(FILE *f);
+int    sy_desktop_dir(char *out, size_t n);
 int    path_fsync(const char *path);
 
 #endif

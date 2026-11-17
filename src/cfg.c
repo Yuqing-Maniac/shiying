@@ -4,6 +4,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 Config cfg;
 
@@ -50,9 +53,14 @@ static void default_outdir(char *out) {
 static void cfg_defaults(void) {
     memset(&cfg, 0, sizeof cfg);
     cfg.area = AREA_SCREEN;
+    cfg.mode = SY_RECORD_SCREEN;
+    cfg.remember_selection = 1;
+    cfg.desktop_copy = 1;
+    cfg.show_thumbnail = 1;
+    cfg.theme = 1;
     cfg.monitor = -1;
     cfg.audio = SY_AUDIO_SYSTEM;
-    cfg.fps = 24;
+    cfg.fps = 60;
     cfg.quality = 1;
     cfg.scale = 0;
     cfg.fmt = SY_MP4;
@@ -73,6 +81,12 @@ static const struct {
     size_t cap;
 } keys[] = {
     { "area", CF_INT, offsetof(Config, area), 0 },
+    { "mode", CF_INT, offsetof(Config, mode), 0 },
+    { "remember_selection", CF_INT, offsetof(Config, remember_selection), 0 },
+    { "desktop_copy", CF_INT, offsetof(Config, desktop_copy), 0 },
+    { "show_thumbnail", CF_INT, offsetof(Config, show_thumbnail), 0 },
+    { "click_highlight", CF_INT, offsetof(Config, click_highlight), 0 },
+    { "theme", CF_INT, offsetof(Config, theme), 0 },
     { "monitor", CF_INT, offsetof(Config, monitor), 0 },
     { "rx", CF_INT, offsetof(Config, rx), 0 },
     { "ry", CF_INT, offsetof(Config, ry), 0 },
@@ -93,14 +107,26 @@ static const struct {
 };
 
 static void clamp_loaded(void) {
-    if (cfg.fps != 10 && cfg.fps != 15 && cfg.fps != 24 && cfg.fps != 30) cfg.fps = 24;
+    if (cfg.fps != 10 && cfg.fps != 15 && cfg.fps != 24 && cfg.fps != 30 && cfg.fps != 60) cfg.fps = 60;
     if (cfg.quality < 0 || cfg.quality > 2) cfg.quality = 1;
     if (cfg.scale < 0 || cfg.scale > 2) cfg.scale = 0;
     if (cfg.audio < SY_AUDIO_SILENCE || cfg.audio > SY_AUDIO_DEVICE) cfg.audio = SY_AUDIO_SYSTEM;
     if (cfg.audio == SY_AUDIO_DEVICE && !cfg.audio_dev[0]) cfg.audio = SY_AUDIO_SYSTEM;
     if (cfg.fmt != SY_MP4 && cfg.fmt != SY_MKV) cfg.fmt = SY_MP4;
     if (cfg.countdown != 0 && cfg.countdown != 3 && cfg.countdown != 5) cfg.countdown = 3;
-    if (cfg.area != AREA_REGION) cfg.area = AREA_SCREEN;
+    if (cfg.area != AREA_REGION && cfg.area != AREA_WINDOW) cfg.area = AREA_SCREEN;
+    if (cfg.mode < 0 || cfg.mode >= SY_MODE_COUNT) cfg.mode = SY_RECORD_SCREEN;
+    cfg.remember_selection = !!cfg.remember_selection;
+    cfg.desktop_copy = !!cfg.desktop_copy;
+    cfg.show_thumbnail = !!cfg.show_thumbnail;
+    cfg.click_highlight = !!cfg.click_highlight;
+    cfg.theme = cfg.theme == 1;
+    if (!cfg.remember_selection) {
+        cfg.mode = SY_RECORD_SCREEN;
+        cfg.area = AREA_SCREEN;
+        cfg.monitor = -1;
+        cfg.rx = cfg.ry = cfg.rw = cfg.rh = 0;
+    }
     if (cfg.codec != SY_H264 && cfg.codec != SY_H265) cfg.codec = SY_H264;
     if (cfg.cursor < SY_CURSOR_OFF || cfg.cursor > SY_CURSOR_MAG) cfg.cursor = SY_CURSOR_ORIG;
     if (cfg.segment_unit != SY_UNIT_MB && cfg.segment_unit != SY_UNIT_GB) cfg.segment_unit = SY_UNIT_GB;
@@ -115,7 +141,7 @@ void cfg_load(void) {
     snprintf(p, sizeof p, "%s/config.ini", g_conf_dir);
     FILE *f = fopen(p, "r");
     if (!f) return;
-    int saw_cursor = 0, saw_mouse = 0, mouse_val = 1;
+    int saw_cursor = 0, saw_mouse = 0, saw_mode = 0, mouse_val = 1;
     while (fgets(line, sizeof line, f)) {
         char *eq = strchr(line, '=');
         if (!eq || line[0] == '#') continue;
@@ -133,11 +159,13 @@ void cfg_load(void) {
             if (keys[i].kind == CF_STR) snprintf(slot, keys[i].cap, "%s", v);
             else *(int *)slot = atoi(v);
             if (!strcmp(k, "cursor")) saw_cursor = 1;
+            if (!strcmp(k, "mode")) saw_mode = 1;
             break;
         }
     }
     fclose(f);
     if (!saw_cursor && saw_mouse) cfg.cursor = mouse_val ? SY_CURSOR_ORIG : SY_CURSOR_OFF;
+    if (!saw_mode && cfg.area == AREA_REGION) cfg.mode = SY_RECORD_REGION;
     clamp_loaded();
 }
 
@@ -148,13 +176,25 @@ void cfg_save(void) {
     snprintf(tmp, sizeof tmp, "%s.tmp", p);
     FILE *f = fopen(tmp, "w");
     if (!f) return;
-    fprintf(f, "# 拾影录屏 配置文件\n");
+    fprintf(f, "# " APP_NAME " 配置文件\n");
     for (size_t i = 0; i < sizeof keys / sizeof keys[0]; i++) {
         char *slot = (char *)&cfg + keys[i].off;
         if (keys[i].kind == CF_STR) fprintf(f, "%s=%s\n", keys[i].key, slot);
-        else fprintf(f, "%s=%d\n", keys[i].key, *(int *)slot);
+        else {
+            if (!cfg.remember_selection && keys[i].off <= offsetof(Config, rh)) continue;
+            fprintf(f, "%s=%d\n", keys[i].key, *(int *)slot);
+        }
     }
     file_fsync(f);
-    fclose(f);
-    rename(tmp, p);
+    int failed = ferror(f);
+    if (fclose(f) != 0) failed = 1;
+#ifdef _WIN32
+    wchar_t from[1110], to[1100];
+    if (!failed && MultiByteToWideChar(CP_UTF8, 0, tmp, -1, from, 1110) &&
+        MultiByteToWideChar(CP_UTF8, 0, p, -1, to, 1100) &&
+        MoveFileExW(from, to, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) return;
+#else
+    if (!failed && rename(tmp, p) == 0) return;
+#endif
+    remove(tmp);
 }

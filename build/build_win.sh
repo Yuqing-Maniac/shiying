@@ -12,8 +12,8 @@ mkdir -p "$OUT"
 $ZIG cc -target x86_64-windows-gnu -O2 -std=gnu11 -Wall -Wno-unused-result \
   -D_FILE_OFFSET_BITS=64 -DSHIYING_WIN -Wl,--subsystem,windows \
   src/winmain.c src/session.c src/cfg.c src/path.c "$OUT/app.o" \
-  -o "$OUT/拾影录屏.exe" \
-  -lgdi32 -luser32 -lole32 -lshell32 -luuid -loleaut32 -lcomctl32
-echo "== windows: $(stat -c %s "$OUT/拾影录屏.exe") 字节"
-x86_64-w64-mingw32-objdump -x "$OUT/拾影录屏.exe" | grep -q "Entry: ID: 0x00000e" || { echo "exe 缺少 RT_GROUP_ICON" >&2; exit 1; }
-x86_64-w64-mingw32-objdump -x "$OUT/拾影录屏.exe" | grep -q "Entry: ID: 0x000003" || { echo "exe 缺少 RT_ICON" >&2; exit 1; }
+  -o "$OUT/映刻录屏.exe" \
+  -lgdi32 -luser32 -lole32 -lshell32 -luuid -loleaut32 -lcomctl32 -ldwmapi
+echo "== windows: $(stat -c %s "$OUT/映刻录屏.exe") 字节"
+x86_64-w64-mingw32-objdump -x "$OUT/映刻录屏.exe" | grep -q "Entry: ID: 0x00000e" || { echo "exe 缺少 RT_GROUP_ICON" >&2; exit 1; }
+x86_64-w64-mingw32-objdump -x "$OUT/映刻录屏.exe" | grep -q "Entry: ID: 0x000003" || { echo "exe 缺少 RT_ICON" >&2; exit 1; }

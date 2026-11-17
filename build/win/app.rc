@@ -1,2 +1,29 @@
 1 ICON "app.ico"
 1 24 "app.manifest"
+
+STRINGTABLE
+BEGIN
+    201 L"\x6620\x523B\x5F55\x5C4F"
+END
+
+1 VERSIONINFO
+ FILEVERSION 1,1,0,0
+ PRODUCTVERSION 1,1,0,0
+ FILEOS 0x00040004
+ FILETYPE 0x00000001
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "080404B0"
+        BEGIN
+            VALUE "FileDescription", L"\x6620\x523B\x5F55\x5C4F"
+            VALUE "ProductName", L"\x6620\x523B\x5F55\x5C4F"
+            VALUE "FileVersion", "1.1.0"
+            VALUE "ProductVersion", "1.1.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0804, 1200
+    END
+END

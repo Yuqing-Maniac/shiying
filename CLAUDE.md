@@ -1,4 +1,4 @@
-# CLAUDE.md：拾影录屏 Shiying 维护指南（给接手的 Claude）
+# CLAUDE.md：映刻录屏维护指南（给接手的 Claude）
 
 ## 1. 一句话
 银河麒麟 V10 轻量录屏工具，飞腾 arm64 为主、兼出 x86_64。C 语言写的 Xlib 自绘界面（约 0.12 MB）负责交互和调度，录制交给同目录的静态 ffmpeg 子进程（x11grab＋libx264＋AAC），声音在界面进程里用 libpulse-simple 采集混音后经管道送给 ffmpeg。
@@ -56,7 +56,7 @@ _work/        （gitignore）构建、依赖、发布包、测试临时文件；
 - 引擎所在分区 `noexec`（U 盘等）或无执行位时，自动复制到 `~/.cache/shiying/ffmpeg` 再用。
 
 **桌面集成**（吸取千寻的教训）
-- 窗口 WM_CLASS、`.desktop` 的 `StartupWMClass`、deb 包名统一为 ASCII 的 `shiying`；`.desktop` 文件名也用 ASCII（`shiying.desktop`，桌面上的副本叫 `拾影录屏.desktop`）；Icon 用 PNG 绝对路径。
+- 窗口 WM_CLASS、`.desktop` 的 `StartupWMClass`、deb 包名统一为 ASCII 的 `shiying`；`.desktop` 文件名也用 ASCII（`shiying.desktop`）。桌面新入口叫 `映刻录屏.desktop`，确认是本产品的旧入口会就地更新。Icon 用 PNG 绝对路径。
 - 单实例：选择区 `_SHIYING_INSTANCE`，第二个进程把命令（显示／切换／暂停／停止／退出）用 ClientMessage 转给第一个后退出。
 - 全局快捷键用 XGrabKey，同时抓 CapsLock、NumLock 组合；被占用时界面提示改用系统自定义快捷键绑定 `--toggle`。
 - 控制条在有合成器时用 32 位 ARGB 视觉做圆角半透明，没有时退化为不透明矩形。
@@ -93,10 +93,10 @@ apt-get install -y xvfb pulseaudio pulseaudio-utils x11-xserver-utils fonts-noto
 ```
 bash build/fetch_deps.sh        # 录制引擎 → _work/vendor/ffmpeg-{x86_64,aarch64,win-x86_64.exe}
 bash build/build.sh all         # 麒麟界面 → _work/build/{x86_64,aarch64}/shiying
-bash build/build_win.sh         # Windows 界面 → _work/build/x86_64-windows/拾影录屏.exe
+bash build/build_win.sh         # Windows 界面 → _work/build/x86_64-windows/映刻录屏.exe
 bash build/release.sh           # 发布包 → _work/dist/（麒麟包在前，Windows zip 在后，另有校验值.txt）
 bash build/build_all.sh         # 以上三步
-python3 build/mkicon.py assets  # 改图标时重新生成 assets/（含 icon_data.h）
+python3 build/mkicon.py assets --ico build/win/app.ico  # 以 assets/shiying.png 为主图重新生成多尺寸资源
 ```
 
 **测试**
@@ -107,7 +107,7 @@ bash tests/run_tests.sh         # 无头回归：自检、单实例、录制／�
 arm64 界面程序无法在 x86 沙箱里启动（没有 arm64 运行库），只能核对依赖与符号；arm64 引擎可以用 `qemu-aarch64-static` 包装成 `录制引擎/ffmpeg` 跑通全流程（开发时做过，见 docs/TEST_REPORT.md）。
 
 **CI（仓库根目录 `.github/workflows/`）**
-- `shiying-ci.yml`：PR 与合并到 main 时，装依赖 → `fetch_deps.sh` → `build.sh all` → `build_win.sh` → `release.sh` → `tests/run_tests.sh`。Windows 免安装包再在 `windows-latest` 上只跑 `拾影录屏.exe --check`，不录屏。
+- `shiying-ci.yml`：PR 与合并到 main 时，装依赖 → `fetch_deps.sh` → `build.sh all` → `build_win.sh` → `release.sh` → `tests/run_tests.sh`。Windows 免安装包再在 `windows-latest` 上只跑 `映刻录屏.exe --check`，不录屏。
 - `shiying-release.yml`：在 Releases 页面发布标签 `shiying-v<版本>` 后，先校验标签版本等于 `APP_VERSION`（不等即失败），再 `build_all.sh` 从零构建，由 `build/release_assets.sh` 把 `_work/dist/` 下的包复制成 ASCII 资产名（如 `shiying_<版本>_kylin_arm64_portable.tar.gz`），以中文名作显示标签挂到该版本，并附对应 ASCII 名的 `SHA256SUMS.txt`（显示名“校验值.txt”）。发版前先通过 PR 更新 `src/path.h` 的 `APP_VERSION` 与 `CHANGELOG.md`；release.sh 从 `APP_VERSION` 取版本号。
 
 ## 6. 现状与待办

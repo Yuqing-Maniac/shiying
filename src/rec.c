@@ -61,6 +61,7 @@ int rec_begin(Display *d, int x, int y, int w, int h) {
     plan.cursor = (SyCursor)cfg.cursor;
     plan.audio = (SyAudio)cfg.audio;
     plan.limit_bytes = sy_limit_bytes(n, u);
+    plan.desktop_copy = cfg.desktop_copy;
     if (cfg.audio == SY_AUDIO_DEVICE)
         snprintf(plan.device_id, sizeof plan.device_id, "%s", cfg.audio_dev);
     snprintf(plan.display, sizeof plan.display, "%s", DisplayString(d));

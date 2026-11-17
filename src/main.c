@@ -1,8 +1,12 @@
-/* 拾影录屏 —— 界面与主循环（Xlib 自绘，单线程事件循环） */
+/* 映刻录屏 —— 界面与主循环（Xlib 自绘，单线程事件循环） */
 #include "common.h"
+#include "toolbar.h"
 #include <X11/keysym.h>
 #include <X11/cursorfont.h>
 #include <X11/Xresource.h>
+#include <X11/extensions/XI2.h>
+#include <X11/extensions/shapeconst.h>
+#include <dlfcn.h>
 #include <math.h>
 #include <unistd.h>
 #include <signal.h>
@@ -24,6 +28,7 @@ static int has_comp;                 /* 有合成器，可用半透明圆角 */
 static XVisualInfo argb_vi;
 static int has_argb;
 static volatile sig_atomic_t quit_req;
+enum { CMD_SHOW = 1, CMD_TOGGLE = 2, CMD_PAUSE = 3, CMD_STOP = 4, CMD_QUIT = 5 };
 static int hotkey_conflict;
 
 static Atom A_DEL, A_PROTO, A_ICON, A_STATE, A_ABOVE, A_SKIPTB, A_SKIPPG, A_TYPE, A_T_DOCK, A_T_DIALOG, A_T_UTIL, A_T_DESKTOP,
@@ -32,20 +37,20 @@ static Atom A_DEL, A_PROTO, A_ICON, A_STATE, A_ABOVE, A_SKIPTB, A_SKIPPG, A_TYPE
 #define P(v) ((v) * S)
 
 /* 配色 */
-#define C_BG      hexc(0xF3F5F8)
-#define C_CARD    hexc(0xFFFFFF)
-#define C_BORDER  hexc(0xE3E7ED)
-#define C_TEXT    hexc(0x1D2129)
-#define C_SUB     hexc(0x86909C)
-#define C_ACC     hexc(0x2F7DF6)
-#define C_ACC_H   hexc(0x4A8EF8)
-#define C_SEG     hexc(0xEEF1F5)
-#define C_SEG_H   hexc(0xE1E6ED)
-#define C_RED     hexc(0xEE3F35)
-#define C_RED_H   hexc(0xF35A50)
-#define C_GREEN   hexc(0x19A15F)
-#define C_ORANGE  hexc(0xD97B00)
-#define C_WHITE   hexc(0xFFFFFF)
+#define C_BG      hexc(SY_UI_BG)
+#define C_CARD    hexc(SY_UI_PANEL)
+#define C_BORDER  hexc(SY_UI_BORDER)
+#define C_TEXT    hexc(SY_UI_TEXT)
+#define C_SUB     hexc(SY_UI_SUB)
+#define C_ACC     hexc(SY_UI_ACCENT)
+#define C_ACC_H   hexc(SY_UI_COLOR(0x1C4A9D, 0xA7CBFF))
+#define C_SEG     hexc(SY_UI_SEG)
+#define C_SEG_H   hexc(SY_UI_SEG_H)
+#define C_RED     hexc(SY_UI_RECORD)
+#define C_RED_H   hexc(SY_UI_COLOR(0x9D303B, 0xFFA6AE))
+#define C_GREEN   hexc(cfg.theme ? 0x82D8AC : 0x16734E)
+#define C_ORANGE  hexc(cfg.theme ? 0xF1BF75 : 0x9B5410)
+#define C_ON_ACCENT hexc(SY_UI_ON_ACCENT)
 
 /* ---------------- 窗口封装 ---------------- */
 typedef struct { int x, y, w, h, id, arg; } Hit;
@@ -62,20 +67,26 @@ typedef struct Win {
 } Win;
 
 static Win wmain, wbar, wcd, wpick;
-static Window wborder[4];
+static Window wborder[4], wclick;
+static void *click_shape_lib, *click_input_lib;
+static int click_opcode, click_down, click_diameter, click_raw_active;
+static double click_until;
 static int borders_on;
 
 enum {
-    H_NONE = 0, H_AREA, H_MON_PREV, H_MON_NEXT, H_RESELECT, H_AUDIO, H_FPS, H_QUAL, H_SCALE, H_FMT, H_CD,
+    H_NONE = 0, H_MODE, H_SETTINGS, H_THEME, H_MON_PREV, H_MON_NEXT, H_RESELECT, H_AUDIO, H_FPS, H_QUAL, H_SCALE, H_FMT, H_CD,
     H_CODEC, H_CURSOR, H_SEG, H_UNIT, H_DEV_PREV, H_DEV_NEXT,
-    H_OPEN_DIR, H_CHANGE_DIR, H_START, H_RES_PLAY, H_RES_DIR,
+    H_OPEN_DIR, H_CHANGE_DIR, H_START, H_RES_PLAY,
+    H_REMEMBER, H_DESKTOP_COPY, H_THUMBNAIL, H_CLICK_HIGHLIGHT,
     H_BAR_PAUSE, H_BAR_STOP, H_BAR_HIDE,
     H_PK_ENTRY, H_PK_UP, H_PK_QUICK, H_PK_CANCEL, H_PK_OK
 };
 
 static int counting;
 static double cd_until;
-static int seg_focus;
+static int seg_focus, settings_open, nav_id, nav_arg;
+static double startup_since;
+static double next_intro_frame;
 static int audio_before = SY_AUDIO_SYSTEM;
 static SyCaps ui_caps;
 static SyChoice ui_codec[4], ui_cont[4], ui_curs[4], ui_aud[4];
@@ -168,7 +179,7 @@ static void set_wm_icon(Window w) {
 static void set_props(Window w, const char *title, Atom type) {
     XClassHint ch = { (char *)APP_ID, (char *)APP_ID };
     XSetClassHint(dpy, w, &ch);
-    XStoreName(dpy, w, "Shiying");
+    Xutf8SetWMProperties(dpy, w, title, title, NULL, 0, NULL, NULL, NULL);
     XChangeProperty(dpy, w, A_NAME, A_UTF8, 8, PropModeReplace, (const unsigned char *)title, (int)strlen(title));
     long pid = getpid();
     XChangeProperty(dpy, w, A_PID, XA_CARDINAL, 32, PropModeReplace, (unsigned char *)&pid, 1);
@@ -196,7 +207,7 @@ static void win_create(Win *w, int x, int y, int W, int H, int argb, int overrid
         a.background_pixel = 0;
         w->argb = 1;
     } else {
-        a.background_pixel = 0xF3F5F8;
+        a.background_pixel = SY_UI_BG;
         w->argb = 0;
     }
     a.border_pixel = 0;
@@ -288,14 +299,14 @@ static void segmented(Win *w, double x, double y, double ww, double hh, const ch
         double ix = x + i * iw;
         if (i == sel) fill_rrect(s, ix + P(2), y + P(2), iw - P(4), hh - P(4), P(6), C_ACC);
         else if (is_hov(w, id, i)) fill_rrect(s, ix + P(2), y + P(2), iw - P(4), hh - P(4), P(6), C_SEG_H);
-        text_c(s, ix + iw / 2, y + hh / 2, items[i], 13, 0, i == sel ? C_WHITE : C_TEXT);
+        text_c(s, ix + iw / 2, y + hh / 2, items[i], 13, 0, i == sel ? C_ON_ACCENT : C_TEXT);
         hit_add(w, ix, y, iw, hh, id, i);
     }
 }
 
 static void small_btn(Win *w, double x, double y, double ww, double hh, const char *t, int id, int arg) {
     Surf *s = w->s;
-    fill_rrect(s, x, y, ww, hh, P(6), is_hov(w, id, arg) ? hexc(0xEEF2F7) : C_WHITE);
+    fill_rrect(s, x, y, ww, hh, P(6), is_hov(w, id, arg) ? C_SEG_H : C_CARD);
     stroke_rrect(s, x, y, ww, hh, P(6), P(1), C_BORDER);
     text_c(s, x + ww / 2, y + hh / 2, t, 12.5, 0, C_TEXT);
     hit_add(w, x, y, ww, hh, id, arg);
@@ -309,7 +320,6 @@ static void link_btn(Win *w, double x, double cy, const char *t, int id, int arg
 }
 
 static void card(Surf *s, double x, double y, double ww, double hh) {
-    fill_rrect(s, x, y + P(1), ww, hh, P(12), hexc(0xE9ECF1));
     fill_rrect(s, x, y, ww, hh, P(12), C_CARD);
     stroke_rrect(s, x, y, ww, hh, P(12), P(1), C_BORDER);
 }
@@ -321,21 +331,36 @@ static void fmt_dur(char *o, size_t n, double sec) {
 
 /* ---------------- 状态 ---------------- */
 static char status_msg[1400];
-static uint32_t status_col;
+typedef enum { STATUS_TEXT, STATUS_WARN, STATUS_SUCCESS, STATUS_ERROR } StatusTone;
+static StatusTone status_tone;
 static char warn_msg[300];
 static int ui_state_prev = REC_IDLE;
 static double pending_start_at;      /* 倒计时结束后延迟启动的时刻 */
 static int pending_x, pending_y, pending_w, pending_h;
 static int bar_hidden;
-static int select_then_start;
+static int pending_is_shot;
+static SyShot *shot;
+static char shot_result[1200];
+static uint32_t shot_preview[180 * 104];
+static int shot_preview_w, shot_preview_h;
+static const int fps_values[] = { 10, 15, 24, 30, 60 };
 
-static void set_status(const char *msg, uint32_t c) {
+static void set_status(const char *msg, StatusTone tone) {
     snprintf(status_msg, sizeof status_msg, "%s", msg);
-    status_col = c;
+    status_tone = tone;
 }
 
-static void target_rect(int *x, int *y, int *w, int *h) {
-    if (cfg.area == AREA_REGION && cfg.rw > 0 && cfg.rh > 0) {
+static uint32_t status_color(void) {
+    switch (status_tone) {
+    case STATUS_WARN: return C_ORANGE;
+    case STATUS_SUCCESS: return C_GREEN;
+    case STATUS_ERROR: return C_RED;
+    default: return C_TEXT;
+    }
+}
+
+static void target_rect(int area, int *x, int *y, int *w, int *h) {
+    if (area == AREA_REGION) {
         *x = cfg.rx; *y = cfg.ry; *w = cfg.rw; *h = cfg.rh;
     } else if (cfg.monitor >= 0 && cfg.monitor < g_nmons) {
         Mon *m = &g_mons[cfg.monitor];
@@ -351,60 +376,123 @@ static void target_rect(int *x, int *y, int *w, int *h) {
 }
 
 /* ---------------- 主窗口 ---------------- */
-#define MAIN_W 480
-#define MAIN_H 760
-#define CARD_SET_H 326
+#define MAIN_W 684
+#define MAIN_H 224
+#define MAIN_SETTINGS_H 610
+#define MAIN_PREVIEW_H 342
+#define SETTINGS_CARD_H 314
 
-static void draw_main(Win *w) {
-    Surf *s = w->s;
-    surf_clear(s, C_BG);
-    double X = P(16), CW = P(MAIN_W - 32);
-    /* 标题区 */
-    blit_argb(s, S >= 1.5 ? ICON64 : ICON48, S >= 1.5 ? 64 : 48, S >= 1.5 ? 64 : 48, (int)P(20), (int)P(18), (int)P(40), (int)P(40));
-    text_l(s, P(70), P(30), APP_NAME, 19, 1, C_TEXT);
-    text_l(s, P(70), P(50), "轻量录屏 · 免安装 · 银河麒麟", 12, 0, C_SUB);
-    char ver[32];
-    snprintf(ver, sizeof ver, "v%s", APP_VERSION);
-    text_l(s, P(MAIN_W - 20) - TX(ver, 11.5, 0), P(30), ver, 11.5, 0, C_SUB);
+static int mode_area(int mode) {
+    int kind = mode % 3;
+    return kind == 0 ? AREA_SCREEN : kind == 1 ? AREA_WINDOW : AREA_REGION;
+}
 
-    /* 卡片一：录制范围 */
-    double y = P(72);
-    card(s, X, y, CW, P(116));
-    text_l(s, X + P(16), y + P(22), "录制范围", 13, 1, C_TEXT);
-    static const char *areas[] = { "全屏", "自选区域 / 窗口" };
-    segmented(w, X + P(16), y + P(38), CW - P(32), P(34), areas, 2, cfg.area, H_AREA);
-    double ry = y + P(94);
-    char buf[300];
-    if (cfg.area == AREA_SCREEN) {
-        int x0, y0, ww, hh;
-        target_rect(&x0, &y0, &ww, &hh);
-        if (cfg.monitor < 0) snprintf(buf, sizeof buf, "%s　%d × %d", g_nmons > 1 ? "全部屏幕" : "整个屏幕", ww, hh);
-        else snprintf(buf, sizeof buf, "屏幕 %d%s　%d × %d", cfg.monitor + 1, g_mons[cfg.monitor].primary ? "（主屏）" : "", ww, hh);
-        text_c(s, X + CW / 2, ry, buf, 13, 0, C_TEXT);
-        if (g_nmons > 1) {
-            double bx = X + P(26), bx2 = X + CW - P(26);
-            uint32_t c1 = is_hov(w, H_MON_PREV, 0) ? C_ACC : C_SUB, c2 = is_hov(w, H_MON_NEXT, 0) ? C_ACC : C_SUB;
-            double t1[] = { bx + P(4), ry - P(7), bx + P(4), ry + P(7), bx - P(4), ry };
-            double t2[] = { bx2 - P(4), ry - P(7), bx2 - P(4), ry + P(7), bx2 + P(4), ry };
-            fill_poly(s, t1, 3, c1);
-            fill_poly(s, t2, 3, c2);
-            hit_add(w, bx - P(14), ry - P(14), P(28), P(28), H_MON_PREV, 0);
-            hit_add(w, bx2 - P(14), ry - P(14), P(28), P(28), H_MON_NEXT, 0);
+static int preview_visible(void) {
+    return cfg.show_thumbnail && shot_result[0] && shot_preview_w > 0 && shot_preview_h > 0;
+}
+
+static void resize_main(void) {
+    int h = (int)P(settings_open ? MAIN_SETTINGS_H : preview_visible() ? MAIN_PREVIEW_H : MAIN_H);
+    if (wmain.H == h) return;
+
+    /* 绘图缓冲区与窗口大小一起更新，保留 WM_CLASS 和单实例窗口。 */
+    Win *w = &wmain;
+    Surf *surface = surf_new(w->W, h);
+    if (!surface || !surface->px) { surf_free(surface); return; }
+    XImage *image = XCreateImage(dpy, DefaultVisual(dpy, scr), DefaultDepth(dpy, scr),
+                                 ZPixmap, 0, (char *)surface->px, w->W, h, 32, 0);
+    if (!image) { surf_free(surface); return; }
+    w->img->data = NULL;
+    XDestroyImage(w->img);
+    surf_free(w->s);
+    w->s = surface;
+    w->img = image;
+    w->H = h;
+
+    Window child;
+    int x, y;
+    int old_y = 0;
+    x = y = 0;
+    if (XTranslateCoordinates(dpy, w->w, root, 0, 0, &x, &y, &child)) {
+        old_y = y;
+        for (int i = 0; i < g_nmons; i++) {
+            const Mon *m = &g_mons[i];
+            int center = x + w->W / 2;
+            if (center < m->x || center >= m->x + m->w || y < m->y || y >= m->y + m->h) continue;
+            if (y + h + P(44) > m->y + m->h) y = m->y + m->h - h - (int)P(44);
+            if (y < m->y + P(36)) y = m->y + (int)P(36);
+            break;
         }
-    } else {
-        if (cfg.rw > 0) snprintf(buf, sizeof buf, "区域 %d × %d　起点 (%d, %d)", cfg.rw & ~1, cfg.rh & ~1, cfg.rx, cfg.ry);
-        else snprintf(buf, sizeof buf, "尚未框选，开始录制时先框选");
-        text_l(s, X + P(18), ry, buf, 13, 0, cfg.rw > 0 ? C_TEXT : C_SUB);
-        const char *lk = cfg.rw > 0 ? "重新框选" : "现在框选";
-        link_btn(w, X + CW - P(18) - TX(lk, 12.5, 0), ry, lk, H_RESELECT, 0, C_ACC);
     }
+    fixed_size(w->w, w->W, h, x, y);
+    XResizeWindow(dpy, w->w, w->W, h);
+    if (old_y != y) XMoveWindow(dpy, w->w, x, y);
+}
 
-    /* 卡片二：录制设置 */
-    y += P(116 + 10);
-    card(s, X, y, CW, P(CARD_SET_H));
-    text_l(s, X + P(16), y + P(22), "录制设置", 13, 1, C_TEXT);
-    double ly = y + P(38), rowh = P(40), segh = P(30);
-    double lx = X + P(16), lw = P(46);
+static void mode_icon(Surf *s, double x, double y, int shape, int recording, uint32_t color, uint32_t bg) {
+    if (shape == 0) {
+        stroke_rrect(s, x, y, P(22), P(15), P(2), P(1.5), color);
+        fill_rect(s, x + P(8), y + P(16), P(6), P(1.5), color);
+    } else if (shape == 1) {
+        stroke_rrect(s, x + P(4), y, P(18), P(13), P(2), P(1.5), color);
+        fill_rrect(s, x, y + P(4), P(18), P(13), P(2), bg);
+        stroke_rrect(s, x, y + P(4), P(18), P(13), P(2), P(1.5), color);
+        fill_rect(s, x + P(2), y + P(7), P(14), P(1.3), color);
+    } else {
+        for (int i = 0; i < 4; i++) {
+            fill_rect(s, x + P(i * 6), y, P(4), P(1.4), color);
+            fill_rect(s, x + P(i * 6), y + P(15.6), P(4), P(1.4), color);
+        }
+        for (int i = 0; i < 3; i++) {
+            fill_rect(s, x, y + P(3 + i * 4), P(1.4), P(3), color);
+            fill_rect(s, x + P(20.6), y + P(3 + i * 4), P(1.4), P(3), color);
+        }
+    }
+    if (recording) {
+        fill_circle(s, x + P(21), y + P(14.5), P(5.3), bg);
+        fill_circle(s, x + P(21), y + P(14.5), P(3.5), color);
+    }
+}
+
+static void toolbar_group(Win *w, int left, int recording) {
+    static const char *scope[] = { "全屏", "窗口", "区域" };
+    Surf *s = w->s;
+    double x = P(left);
+    card(s, x, P(58), P(318), P(110));
+    text_l(s, x + P(13), P(77), recording ? "录屏" : "截图", 13, 1, recording ? C_RED : C_SUB);
+    for (int i = 0; i < 3; i++) {
+        int mode = i + (recording ? SY_RECORD_SCREEN : SY_CAPTURE_SCREEN);
+        int selected = cfg.mode == mode;
+        double bx = x + P(12 + i * 100);
+        uint32_t color = recording ? C_RED : C_ACC;
+        uint32_t bg = selected || is_hov(w, H_MODE, mode)
+                    ? hexc(recording ? SY_UI_RECORD_TINT : SY_UI_TINT) : C_CARD;
+        fill_rrect(s, bx, P(88), P(94), P(66), P(9), bg);
+        if (selected) stroke_rrect(s, bx, P(88), P(94), P(66), P(9), P(1), color);
+        mode_icon(s, bx + P(36), P(101), i, recording, color, bg);
+        text_c(s, bx + P(47), P(137), scope[i], 13, selected, selected ? color : C_TEXT);
+        hit_add(w, bx, P(88), P(94), P(66), H_MODE, mode);
+    }
+}
+
+static void toggle_btn(Win *w, double x, double y, const char *label, int id, int active) {
+    double width = P(141);
+    Surf *s = w->s;
+    fill_rrect(s, x, y, width, P(26), P(7),
+               active || is_hov(w, id, 0) ? hexc(SY_UI_TINT) : C_SEG);
+    text_c(s, x + width / 2, y + P(13), label, 12, active, active ? C_ACC : C_SUB);
+    hit_add(w, x, y, width, P(26), id, 0);
+}
+
+static void draw_settings(Win *w) {
+    Surf *s = w->s;
+    double X = P(18), CW = P(MAIN_W - 36);
+    double y = P(MAIN_H);
+    card(s, X, y, CW, P(SETTINGS_CARD_H));
+    text_l(s, X + P(16), y + P(21), "采集设置", 14, 1, C_TEXT);
+    text_l(s, X + CW - P(216), y + P(21), "SDR · Rec.2100 HLG 暂不可用", 12, 0, C_SUB);
+    double ly = y + P(34), rowh = P(33), segh = P(27);
+    double lx = X + P(16), lw = P(58);
     double half = (CW - P(32) - P(16)) / 2;
     double rx = lx + half + P(16);
     const char *alab[4];
@@ -412,10 +500,11 @@ static void draw_main(Win *w) {
     text_l(s, lx, ly + segh / 2, "声音", 13, 0, C_SUB);
     if (n_aud) segmented(w, lx + lw, ly, CW - P(32) - lw, segh, alab, n_aud, choice_sel(ui_aud, n_aud, cfg.audio), H_AUDIO);
     ly += rowh;
-    static const char *fps[] = { "10", "15", "24", "30" };
-    int fsel = cfg.fps == 10 ? 0 : cfg.fps == 15 ? 1 : cfg.fps == 24 ? 2 : 3;
+    static const char *fps[] = { "10", "15", "24", "30", "60" };
+    int fsel = 0;
+    for (int i = 0; i < 5; i++) if (cfg.fps == fps_values[i]) fsel = i;
     text_l(s, lx, ly + segh / 2, "帧率", 13, 0, C_SUB);
-    segmented(w, lx + lw, ly, half - lw, segh, fps, 4, fsel, H_FPS);
+    segmented(w, lx + lw, ly, half - lw, segh, fps, 5, fsel, H_FPS);
     static const char *ql[] = { "流畅", "标准", "高清" };
     text_l(s, rx, ly + segh / 2, "画质", 13, 0, C_SUB);
     segmented(w, rx + lw, ly, half - lw, segh, ql, 3, cfg.quality, H_QUAL);
@@ -448,22 +537,21 @@ static void draw_main(Win *w) {
         char num[16];
         snprintf(num, sizeof num, "%d", cfg.segment_n);
         double bx = lx + lw, bw = P(72);
-        fill_rrect(s, bx, ly, bw, segh, P(6), C_WHITE);
+        fill_rrect(s, bx, ly, bw, segh, P(6), C_CARD);
         stroke_rrect(s, bx, ly, bw, segh, P(6), P(seg_focus ? 1.6 : 1), seg_focus ? C_ACC : C_BORDER);
         text_c(s, bx + bw / 2, ly + segh / 2, num, 13, 0, C_TEXT);
         hit_add(w, bx, ly, bw, segh, H_SEG, 0);
         static const char *un[] = { "MB", "GB" };
-        segmented(w, bx + bw + P(8), ly, P(120), segh, un, 2, cfg.segment_unit == SY_UNIT_GB ? 1 : 0, H_UNIT);
+        segmented(w, bx + bw + P(8), ly, P(98), segh, un, 2, cfg.segment_unit == SY_UNIT_GB ? 1 : 0, H_UNIT);
     }
-    ly += rowh;
-    text_l(s, lx, ly + segh / 2, "设备", 13, 0, C_SUB);
+    text_l(s, rx, ly + segh / 2, "音源", 13, 0, C_SUB);
     {
         const char *show = "未指定";
         if (cfg.audio == SY_AUDIO_DEVICE) {
             if (dev_i >= 0 && dev_i < n_dev) show = ui_dev[dev_i].label;
             else if (cfg.audio_dev[0]) show = cfg.audio_dev;
         }
-        double ax = lx + lw + P(8), ax2 = X + CW - P(28);
+        double ax = rx + lw + P(8), ax2 = X + CW - P(28);
         char eld[300];
         elide_front(eld, sizeof eld, show, ax2 - ax - P(36), 13);
         text_c(s, (ax + ax2) / 2, ly + segh / 2, eld, 13, 0, C_TEXT);
@@ -479,8 +567,15 @@ static void draw_main(Win *w) {
         }
     }
 
-    /* 卡片三：保存位置 */
-    y += P(CARD_SET_H + 10);
+    ly += rowh + P(7);
+    toggle_btn(w, lx, ly, "记住选择", H_REMEMBER, cfg.remember_selection);
+    toggle_btn(w, lx + P(155), ly, "桌面副本", H_DESKTOP_COPY, cfg.desktop_copy);
+    toggle_btn(w, rx, ly, "显示缩略图", H_THUMBNAIL, cfg.show_thumbnail);
+    if (wclick) toggle_btn(w, rx + P(155), ly, "显示鼠标点击", H_CLICK_HIGHLIGHT, cfg.click_highlight);
+    else text_c(s, rx + P(225), ly + P(13), "鼠标点击效果不可用", 12, 0, C_SUB);
+
+    /* 保存目录 */
+    y += P(SETTINGS_CARD_H + 10);
     card(s, X, y, CW, P(52));
     text_l(s, X + P(16), y + P(26), "保存到", 13, 0, C_SUB);
     double bw = P(52);
@@ -491,67 +586,111 @@ static void draw_main(Win *w) {
     small_btn(w, X + CW - P(16) - bw * 2 - P(8), y + P(12), bw, P(28), "打开", H_OPEN_DIR, 0);
     small_btn(w, X + CW - P(16) - bw, y + P(12), bw, P(28), "更改", H_CHANGE_DIR, 0);
 
-    /* 开始按钮 */
-    y += P(52 + 14);
-    int busy = counting || rec.state != REC_IDLE;
-    uint32_t bc = busy ? hexc(0xF2A19B) : is_hov(w, H_START, 0) ? C_RED_H : C_RED;
-    fill_rrect(s, X, y, CW, P(48), P(12), bc);
-    const char *bt = rec.state == REC_SAVING ? "正在保存…" : "开始录制";
-    double tw = TX(bt, 16, 1);
-    double cx = X + CW / 2 - (tw + P(22)) / 2;
-    if (rec.state != REC_SAVING) {
-        fill_circle(s, cx + P(7), y + P(24), P(7), C_WHITE);
-        fill_circle(s, cx + P(7), y + P(24), P(3.5), bc);
-    }
-    text_l(s, cx + P(22), y + P(24), bt, 16, 1, C_WHITE);
-    hit_add(w, X, y, CW, P(48), H_START, 0);
+}
 
-    /* 快捷键提示 */
-    y += P(48 + 18);
-    if (hotkey_conflict)
-        text_c(s, X + CW / 2, y, "全局快捷键被其他程序占用，可在系统快捷键中绑定命令「拾影录屏 --toggle」", 11.5, 0, C_ORANGE);
-    else
-        text_c(s, X + CW / 2, y, "Ctrl+Alt+R 开始/停止　Ctrl+Alt+P 暂停/继续　Ctrl+Alt+H 隐藏控制条", 11.5, 0, C_SUB);
-
-    /* 状态区 */
-    y += P(22);
-    if (warn_msg[0]) {
-        text_c(s, X + CW / 2, y, warn_msg, 12, 0, C_ORANGE);
-        y += P(20);
-    }
-    if (rec.state == REC_SAVING) {
-        text_c(s, X + CW / 2, y + P(6), rec.recovered ? "正在恢复上次未保存的录像…" : "正在合并保存，请稍候…", 13, 0, C_ACC);
-    } else if (status_msg[0]) {
-        /* 最多两行，按宽度断开 */
-        const char *m = status_msg;
-        double maxw = CW - P(8);
-        char line[700];
-        for (int ln = 0; ln < 2 && *m; ln++) {
-            int len = 0, last_fit = 0;
-            const char *q = m;
-            while (*q) {
-                const char *nx = q + 1;
-                while ((*nx & 0xC0) == 0x80) nx++;
-                len = (int)(nx - m);
-                if (len >= (int)sizeof line - 1) break;
-                memcpy(line, m, len); line[len] = 0;
-                if (TX(line, 12.5, 0) > maxw) break;
-                last_fit = len;
-                q = nx;
+/* 启动动效随正常窗口绘制，所有控件从首帧起都可以操作。 */
+static void draw_brand(Surf *s) {
+    SyIntroFrame frame = sy_intro_frame(startup_since ? now_s() - startup_since : SY_INTRO_SECONDS);
+    double cx = P(34), cy = P(30);
+    int sz = (int)round(P(frame.icon_size));
+    int icon_res = S >= 1.5 ? 64 : 48;
+    const uint32_t *icon = S >= 1.5 ? ICON64 : ICON48;
+    blit_argb(s, icon, icon_res, icon_res, (int)round(cx - sz / 2.0), (int)round(cy - sz / 2.0), sz, sz);
+    if (frame.focus_alpha > 0) {
+        double radius = P(frame.focus), arm = P(frame.arm), width = P(2);
+        uint32_t tone = alpha_mul(C_ACC, frame.focus_alpha);
+        for (int y = -1; y <= 1; y += 2) {
+            for (int x = -1; x <= 1; x += 2) {
+                double left = cx + x * radius - (x > 0 ? arm : 0);
+                double top = cy + y * radius - (y > 0 ? arm : 0);
+                fill_rect(s, left, cy + y * radius - width / 2, arm, width, tone);
+                fill_rect(s, cx + x * radius - width / 2, top, width, arm, tone);
             }
-            if (!last_fit) break;
-            memcpy(line, m, last_fit); line[last_fit] = 0;
-            text_c(s, X + CW / 2, y + ln * P(19), line, 12.5, 0, status_col);
-            m += last_fit;
         }
-        if (rec.result[0] && status_col == C_GREEN) {
-            double ly2 = y + P(24);
-            const char *a = "播放", *b = "打开所在文件夹";
-            double total = TX(a, 12.5, 0) + TX(b, 12.5, 0) + P(28);
-            double sx = X + CW / 2 - total / 2;
-            link_btn(w, sx, ly2, a, H_RES_PLAY, 0, C_ACC);
-            link_btn(w, sx + TX(a, 12.5, 0) + P(28), ly2, b, H_RES_DIR, 0, C_ACC);
+    }
+    if (frame.sweep > 0 && frame.sweep_alpha > 0)
+        fill_rrect(s, P(60), P(44), P(frame.sweep), P(2), P(1), alpha_mul(C_ACC, frame.sweep_alpha));
+    if (frame.tally_alpha > 0)
+        fill_circle(s, P(60 + frame.sweep), P(45), P(3), alpha_mul(C_RED, frame.tally_alpha));
+    text_l(s, P(60), P(30), APP_NAME, 18, 1, C_TEXT);
+}
+
+static void draw_main(Win *w) {
+    Surf *s = w->s;
+    surf_clear(s, C_BG);
+    draw_brand(s);
+    if (hotkey_conflict) text_l(s, P(321), P(30), "录制快捷键被占用", 12, 0, C_ORANGE);
+    small_btn(w, P(472), P(14), P(96), P(30), cfg.theme ? "浅色模式" : "深色模式", H_THEME, 0);
+    small_btn(w, P(582), P(14), P(84), P(30), settings_open ? "收起设置" : "设置", H_SETTINGS, 0);
+    toolbar_group(w, 18, 0);
+    toolbar_group(w, 348, 1);
+
+    int recording = cfg.mode >= SY_RECORD_SCREEN;
+    int busy = counting || shot || rec.state != REC_IDLE;
+    uint32_t action = busy ? C_SEG : recording ? C_RED : C_ACC;
+    if (!busy && is_hov(w, H_START, 0)) action = recording ? C_RED_H : C_ACC_H;
+    fill_rrect(s, P(574), P(174), P(92), P(30), P(8), action);
+    text_c(s, P(620), P(189), recording ? "录制" : "截取", 14, 1, busy ? C_SUB : C_ON_ACCENT);
+    if (!busy) hit_add(w, P(574), P(174), P(92), P(30), H_START, 0);
+
+    if (rec.state == REC_SAVING || shot) {
+        const char *status = shot ? "正在保存截图…" : rec.recovered ? "正在恢复上次未保存的录像…" : "正在保存录像…";
+        text_l(s, P(18), P(194), status, 13, 0, C_ACC);
+    } else if (status_msg[0] || warn_msg[0]) {
+        const char *msg = status_msg[0] ? status_msg : warn_msg;
+        const char *result = shot_result[0] ? shot_result : rec.result;
+        int has_result = status_tone == STATUS_SUCCESS && result[0];
+        char clipped[1400];
+        elide_front(clipped, sizeof clipped, msg, P(has_result ? 444 : 542), 12.5);
+        text_l(s, P(18), P(193), clipped, 12.5, 0, status_msg[0] ? status_color() : C_ORANGE);
+        if (has_result && (settings_open || !preview_visible())) link_btn(w, P(488), P(193), "打开文件", H_RES_PLAY, 0, C_ACC);
+    } else {
+        int area = mode_area(cfg.mode);
+        if (area == AREA_SCREEN) {
+            int k = cfg.monitor >= 0 && cfg.monitor < g_nmons ? cfg.monitor : -1;
+            int width = k >= 0 ? g_mons[k].w : g_root_w;
+            int height = k >= 0 ? g_mons[k].h : g_root_h;
+            char text[96];
+            if (k >= 0) snprintf(text, sizeof text, "屏幕 %d · %d × %d", k + 1, width, height);
+            else snprintf(text, sizeof text, "%s · %d × %d", g_nmons > 1 ? "全部屏幕" : "整个屏幕", width, height);
+            text_l(s, P(18), P(194), text, 13, 0, C_SUB);
+            if (g_nmons > 1) {
+                small_btn(w, P(254), P(180), P(32), P(28), "‹", H_MON_PREV, 0);
+                small_btn(w, P(292), P(180), P(32), P(28), "›", H_MON_NEXT, 0);
+            }
+        } else if (area == AREA_WINDOW) {
+            char text[96];
+            snprintf(text, sizeof text, "%s · 点击选取桌面上的可见窗口", sy_mode_labels[cfg.mode]);
+            text_l(s, P(18), P(194), text, 13, 0, C_SUB);
+        } else if (cfg.remember_selection && cfg.rw >= 16 && cfg.rh >= 16) {
+            char text[96];
+            snprintf(text, sizeof text, "上次框选 · %d × %d", cfg.rw, cfg.rh);
+            text_l(s, P(18), P(194), text, 13, 0, C_SUB);
+            link_btn(w, P(250), P(194), "重新框选", H_RESELECT, 0, C_ACC);
+        } else {
+            text_l(s, P(18), P(194), "拖动鼠标框选要截取的区域", 13, 0, C_SUB);
         }
+    }
+    if (settings_open) draw_settings(w);
+    else if (preview_visible()) {
+        card(s, P(18), P(224), P(648), P(98));
+        double scale = fmin(P(122) / shot_preview_w, P(74) / shot_preview_h);
+        int width = (int)fmax(1, round(shot_preview_w * scale));
+        int height = (int)fmax(1, round(shot_preview_h * scale));
+        int x = (int)P(36), y = (int)P(236) + ((int)P(74) - height) / 2;
+        blit_argb(s, shot_preview, shot_preview_w, shot_preview_h, x, y, width, height);
+        hit_add(w, x, y, width, height, H_RES_PLAY, 1);
+        small_btn(w, P(166), P(241), P(110), P(30), "打开截图", H_RES_PLAY, 0);
+        text_l(s, P(166), P(289), "截图已保存到所选目录", 13, 0, C_SUB);
+    }
+    if (nav_id) {
+        for (int i = 0; i < w->nh; i++) {
+            const Hit *h = &w->hits[i];
+            if (h->id != nav_id || h->arg != nav_arg) continue;
+            stroke_rrect(s, h->x - P(2), h->y - P(2), h->w + P(4), h->h + P(4), P(7), P(1.5), C_ACC);
+            return;
+        }
+        nav_id = 0;
     }
 }
 
@@ -562,19 +701,20 @@ static void draw_main(Win *w) {
 static void draw_bar(Win *w) {
     Surf *s = w->s;
     surf_clear(s, 0);
-    uint32_t bg = w->argb ? rgba(28, 30, 34, 236) : hexc(0x1E2024);
-    fill_rrect(s, 0, 0, w->W, w->H, w->argb ? P(BAR_H / 2.0) : 0, bg);
+    double radius = w->argb ? P(BAR_H / 2.0) : 0;
+    fill_rrect(s, 0, 0, w->W, w->H, radius, C_CARD);
+    stroke_rrect(s, 0, 0, w->W, w->H, radius, P(1), C_BORDER);
     double cy = w->H / 2.0;
     int paused = rec.state == REC_PAUSED;
     double t = now_s();
     double pulse = paused ? 1 : 0.55 + 0.45 * (0.5 + 0.5 * sin(t * 4));
-    fill_circle(s, P(22), cy, P(6), alpha_mul(paused ? hexc(0xF5B731) : C_RED, pulse));
+    fill_circle(s, P(22), cy, P(6), alpha_mul(paused ? C_ORANGE : C_RED, pulse));
     char tb[32];
     fmt_dur(tb, sizeof tb, rec_elapsed());
-    text_l(s, P(36), cy, tb, 15, 1, C_WHITE);
-        if (paused) text_l(s, P(36) + TX("00:00:00", 15, 1) + P(8), cy, "已暂停", 11.5, 0, hexc(0xF5B731));
-        else if (rec.hold == SY_HOLD_CUT) text_l(s, P(36) + TX("00:00:00", 15, 1) + P(8), cy, "正在完成上一段", 11.5, 0, hexc(0xC8CCD2));
-        else {
+    text_l(s, P(36), cy, tb, 15, 1, C_TEXT);
+    if (paused) text_l(s, P(36) + TX("00:00:00", 15, 1) + P(8), cy, "已暂停", 11.5, 0, C_ORANGE);
+    else if (rec.hold == SY_HOLD_CUT) text_l(s, P(36) + TX("00:00:00", 15, 1) + P(8), cy, "正在完成上一段", 11.5, 0, C_SUB);
+    else {
         /* 声音电平 */
         double lv = -1;
         for (int i = 0; i < 2; i++) { double l = audio_level(i); if (l > lv) lv = l; }
@@ -583,7 +723,7 @@ static void draw_bar(Win *w) {
             for (int i = 0; i < 4; i++) {
                 double hh = P(4 + i * 3);
                 int on = lv * 6 > i * 0.6 + 0.05;
-                fill_rrect(s, bx + i * P(5), cy + P(7) - hh, P(3), hh, P(1), on ? hexc(0x4CD07D) : hexc(0x4A4F57));
+                fill_rrect(s, bx + i * P(5), cy + P(7) - hh, P(3), hh, P(1), on ? C_GREEN : C_SEG_H);
             }
         }
     }
@@ -592,19 +732,19 @@ static void draw_bar(Win *w) {
     for (int i = 0; i < 3; i++) {
         double cx = bx + i * P(36) + P(18);
         int id = i == 0 ? H_BAR_PAUSE : i == 1 ? H_BAR_STOP : H_BAR_HIDE;
-        if (is_hov(w, id, 0)) fill_circle(s, cx, cy, P(15), hexc(0x3A3E46));
+        if (is_hov(w, id, 0)) fill_circle(s, cx, cy, P(15), C_SEG_H);
         if (i == 0) {
             if (paused) {
                 double tri[] = { cx - P(4), cy - P(7), cx - P(4), cy + P(7), cx + P(7), cy };
-                fill_poly(s, tri, 3, C_WHITE);
+                fill_poly(s, tri, 3, C_TEXT);
             } else {
-                fill_rrect(s, cx - P(6), cy - P(7), P(4), P(14), P(1), C_WHITE);
-                fill_rrect(s, cx + P(2), cy - P(7), P(4), P(14), P(1), C_WHITE);
+                fill_rrect(s, cx - P(6), cy - P(7), P(4), P(14), P(1), C_TEXT);
+                fill_rrect(s, cx + P(2), cy - P(7), P(4), P(14), P(1), C_TEXT);
             }
         } else if (i == 1) {
             fill_rrect(s, cx - P(7), cy - P(7), P(14), P(14), P(3), C_RED);
         } else {
-            fill_rrect(s, cx - P(7), cy - P(1), P(14), P(2.2), P(1), hexc(0xC8CCD2));
+            fill_rrect(s, cx - P(7), cy - P(1), P(14), P(2.2), P(1), C_SUB);
         }
         hit_add(w, cx - P(17), 0, P(34), w->H, id, 0);
     }
@@ -614,13 +754,15 @@ static void draw_bar(Win *w) {
 static void draw_cd(Win *w) {
     Surf *s = w->s;
     surf_clear(s, 0);
-    fill_rrect(s, 0, 0, w->W, w->H, w->argb ? P(28) : 0, w->argb ? rgba(20, 22, 26, 215) : hexc(0x16181C));
+    double radius = w->argb ? P(28) : 0;
+    fill_rrect(s, 0, 0, w->W, w->H, radius, C_CARD);
+    stroke_rrect(s, 0, 0, w->W, w->H, radius, P(1), C_BORDER);
     int left = (int)ceil(cd_until - now_s());
     if (left < 1) left = 1;
     char b[8];
     snprintf(b, sizeof b, "%d", left);
-    text_c(s, w->W / 2.0, w->H / 2.0 - P(10), b, 72, 1, C_WHITE);
-    text_c(s, w->W / 2.0, w->H - P(24), "单击取消", 12, 0, hexc(0xA9AEB6));
+    text_c(s, w->W / 2.0, w->H / 2.0 - P(10), b, 72, 1, C_TEXT);
+    text_c(s, w->W / 2.0, w->H - P(24), "单击取消", 12, 0, C_SUB);
 }
 
 /* ---------------- 选择目录 ---------------- */
@@ -682,10 +824,10 @@ static void draw_pick(Win *w) {
         int idx = pk_scroll + i;
         double ry = ly + P(2) + i * rh;
         if (ry + rh > ly + lh) break;
-        if (is_hov(w, H_PK_ENTRY, idx)) fill_rrect(s, X + P(4), ry, CW - P(8), rh, P(6), hexc(0xEAF2FE));
+        if (is_hov(w, H_PK_ENTRY, idx)) fill_rrect(s, X + P(4), ry, CW - P(8), rh, P(6), hexc(SY_UI_TINT));
         /* 文件夹图标 */
-        fill_rrect(s, X + P(14), ry + P(10), P(8), P(4), P(1), hexc(0xF4B63F));
-        fill_rrect(s, X + P(14), ry + P(12), P(18), P(12), P(2), hexc(0xF7C55B));
+        fill_rrect(s, X + P(14), ry + P(10), P(8), P(4), P(1), C_ACC);
+        fill_rrect(s, X + P(14), ry + P(12), P(18), P(12), P(2), C_ACC);
         char nm[300];
         elide_front(nm, sizeof nm, pk_names[idx], CW - P(60), 13);
         text_l(s, X + P(42), ry + rh / 2, nm, 13, 0, C_TEXT);
@@ -693,14 +835,14 @@ static void draw_pick(Win *w) {
     }
     if (pk_n > vis) {
         double th = lh * vis / pk_n, ty = ly + (lh - th) * pk_scroll / (double)(pk_n - vis);
-        fill_rrect(s, X + CW - P(7), ty + P(2), P(4), th - P(4), P(2), hexc(0xC9CDD4));
+        fill_rrect(s, X + CW - P(7), ty + P(2), P(4), th - P(4), P(2), C_BORDER);
     }
     /* 底部按钮 */
     double by = w->H - P(50);
     double bw = P(96);
     small_btn(w, X + CW - bw * 2 - P(10), by, bw, P(34), "取消", H_PK_CANCEL, 0);
     fill_rrect(s, X + CW - bw, by, bw, P(34), P(6), is_hov(w, H_PK_OK, 0) ? C_ACC_H : C_ACC);
-    text_c(s, X + CW - bw / 2, by + P(17), "选择此目录", 12.5, 0, C_WHITE);
+    text_c(s, X + CW - bw / 2, by + P(17), "选择此目录", 12.5, 0, C_ON_ACCENT);
     hit_add(w, X + CW - bw, by, bw, P(34), H_PK_OK, 0);
     text_l(s, X, by + P(17), "单击文件夹进入", 12, 0, C_SUB);
 }
@@ -786,22 +928,26 @@ static Rect clip_root(Rect r) {
     return r;
 }
 
-static Rect hover_target(int px, int py) {
+static Rect hover_window(int px, int py) {
     for (int i = nclients - 1; i >= 0; i--) {
         Rect r = clients[i];
         if (px >= r.x && px < r.x + r.w && py >= r.y && py < r.y + r.h) return clip_root(r);
     }
-    for (int i = 0; i < g_nmons; i++) {
-        Mon *m = &g_mons[i];
-        if (px >= m->x && px < m->x + m->w && py >= m->y && py < m->y + m->h) return (Rect){ m->x, m->y, m->w, m->h };
-    }
-    return (Rect){ 0, 0, g_root_w, g_root_h };
+    return (Rect){0};
+}
+
+static Bool selector_event(Display *display, XEvent *ev, XPointer data) {
+    (void)display;
+    if (ev->xany.window == *(const Window *)data) return True;
+    return ev->type == ClientMessage && ev->xclient.message_type == A_CMD &&
+           (ev->xclient.data.l[0] == CMD_QUIT || ev->xclient.data.l[0] == CMD_STOP);
 }
 
 /* 浮层：返回 1 选中，0 取消 */
-static int run_selector(Rect *out) {
+static int run_selector(int area, Rect *out) {
+    int window_mode = area == AREA_WINDOW;
     mons_refresh(dpy);
-    collect_clients();
+    if (window_mode) collect_clients();
     int W = g_root_w, H = g_root_h;
     XImage *shot = XGetImage(dpy, root, 0, 0, W, H, AllPlanes, ZPixmap);
     if (!shot) return 0;
@@ -829,12 +975,13 @@ static int run_selector(Rect *out) {
     XDestroyImage(shot);
     /* 提示条画进暗图 */
     {
-        const char *tip = "拖动鼠标框选区域　·　单击选择窗口或整屏　·　右键 / Esc 取消";
+        const char *tip = window_mode ? "点击选择窗口　·　右键 / Esc 取消"
+                                      : "拖动鼠标框选区域　·　右键 / Esc 取消";
         int tw = (int)(TX(tip, 14, 0) + P(40)), th = (int)P(40);
         Surf *ts = surf_new(tw, th);
-        surf_clear(ts, hexc(0x2B2E33));
-        fill_rrect(ts, 0, 0, tw, th, 0, hexc(0x2B2E33));
-        text_c(ts, tw / 2.0, th / 2.0, tip, 14, 0, C_WHITE);
+        surf_clear(ts, C_CARD);
+        stroke_rrect(ts, 0, 0, tw, th, 0, P(1), C_BORDER);
+        text_c(ts, tw / 2.0, th / 2.0, tip, 14, 0, C_TEXT);
         XImage *ti = XCreateImage(dpy, DefaultVisual(dpy, scr), depth, ZPixmap, 0, (char *)ts->px, tw, th, 32, 0);
         Mon *m = &g_mons[0];
         XPutImage(dpy, dim, gc, ti, 0, 0, m->x + (m->w - tw) / 2, m->y + (int)P(28), tw, th);
@@ -846,46 +993,49 @@ static int run_selector(Rect *out) {
     a.event_mask = ButtonPressMask | ButtonReleaseMask | PointerMotionMask | KeyPressMask | ExposureMask;
     Window ov = XCreateWindow(dpy, root, 0, 0, W, H, 0, depth, InputOutput, DefaultVisual(dpy, scr),
                               CWOverrideRedirect | CWBackPixmap | CWEventMask, &a);
-    set_props(ov, "选择录制区域", 0);
+    set_props(ov, window_mode ? "选取窗口" : "框选区域", 0);
     XMapRaised(dpy, ov);
     Cursor cur = XCreateFontCursor(dpy, XC_crosshair);
-    for (int i = 0; i < 50; i++) {
-        if (XGrabPointer(dpy, ov, False, ButtonPressMask | ButtonReleaseMask | PointerMotionMask, GrabModeAsync, GrabModeAsync, None, cur, CurrentTime) == GrabSuccess) break;
-        usleep(20000);
+    int have_pointer = 0, have_keyboard = 0;
+    for (int i = 0; i < 20 && !quit_req; i++) {
+        if (XGrabPointer(dpy, ov, False, ButtonPressMask | ButtonReleaseMask | PointerMotionMask,
+                         GrabModeAsync, GrabModeAsync, None, cur, CurrentTime) == GrabSuccess) {
+            have_pointer = 1;
+            break;
+        }
+        usleep(10000);
     }
-    for (int i = 0; i < 50; i++) {
-        if (XGrabKeyboard(dpy, ov, True, GrabModeAsync, GrabModeAsync, CurrentTime) == GrabSuccess) break;
-        usleep(20000);
-    }
+    if (have_pointer)
+        have_keyboard = XGrabKeyboard(dpy, ov, False, GrabModeAsync, GrabModeAsync, CurrentTime) == GrabSuccess;
     XGCValues gv;
     gv.line_width = (int)fmax(2, P(2));
-    gv.foreground = 0x2F7DF6;
+    gv.foreground = SY_UI_ACCENT;
     GC lgc = XCreateGC(dpy, ov, GCLineWidth | GCForeground, &gv);
 
-    int dragging = 0, pressed = 0, sx = 0, sy = 0, result = 0, done = 0;
+    int pressed = 0, sx = 0, sy = 0, result = 0, done = 0;
     Rect cur_r = { 0, 0, 0, 0 }, old_r = { 0, 0, 0, 0 }, old_lab = { 0, 0, 0, 0 };
     Window rw, cw; int rx, ry, wx, wy; unsigned int mk;
-    XQueryPointer(dpy, root, &rw, &cw, &rx, &ry, &wx, &wy, &mk);
-    cur_r = hover_target(rx, ry);
+    if (window_mode && XQueryPointer(dpy, root, &rw, &cw, &rx, &ry, &wx, &wy, &mk))
+        cur_r = hover_window(rx, ry);
     int need = 1;
-    while (!done) {
+    while (!done && have_pointer && !quit_req) {
         if (need) {
             int pad = gv.line_width + 2;
             if (old_r.w) XCopyArea(dpy, dim, ov, gc, old_r.x - pad, old_r.y - pad, old_r.w + 2 * pad, old_r.h + 2 * pad, old_r.x - pad, old_r.y - pad);
             if (old_lab.w) XCopyArea(dpy, dim, ov, gc, old_lab.x, old_lab.y, old_lab.w, old_lab.h, old_lab.x, old_lab.y);
             Rect r = cur_r;
-            if (r.w > 0 && r.h > 0) {
+            if (r.w >= 4 && r.h >= 4) {
                 XCopyArea(dpy, bright, ov, gc, r.x, r.y, r.w, r.h, r.x, r.y);
                 XDrawRectangle(dpy, ov, lgc, r.x + gv.line_width / 2, r.y + gv.line_width / 2, r.w - gv.line_width, r.h - gv.line_width);
                 char lab[64];
-                snprintf(lab, sizeof lab, "%d × %d", r.w & ~1, r.h & ~1);
+                snprintf(lab, sizeof lab, "%d × %d", r.w, r.h);
                 int lw = (int)(TX(lab, 12.5, 1) + P(16)), lh = (int)P(24);
                 int lx = r.x, ly = r.y - lh - (int)P(4);
                 if (ly < 0) ly = r.y + (int)P(4), lx = r.x + (int)P(4);
                 if (lx + lw > W) lx = W - lw;
                 Surf *ls = surf_new(lw, lh);
-                surf_clear(ls, hexc(0x2F7DF6));
-                text_c(ls, lw / 2.0, lh / 2.0, lab, 12.5, 1, C_WHITE);
+                surf_clear(ls, C_ACC);
+                text_c(ls, lw / 2.0, lh / 2.0, lab, 12.5, 1, C_ON_ACCENT);
                 XImage *li = XCreateImage(dpy, DefaultVisual(dpy, scr), depth, ZPixmap, 0, (char *)ls->px, lw, lh, 32, 0);
                 XPutImage(dpy, ov, gc, li, 0, 0, lx, ly, lw, lh);
                 li->data = NULL; XDestroyImage(li); surf_free(ls);
@@ -896,35 +1046,57 @@ static int run_selector(Rect *out) {
             need = 0;
         }
         XEvent ev;
-        XNextEvent(dpy, &ev);
-        if (ev.type == Expose && ev.xexpose.window == ov && ev.xexpose.count == 0) { old_r.w = 0; old_lab.w = 0; XClearWindow(dpy, ov); need = 1; }
-        else if (ev.type == MotionNotify) {
+        if (!XCheckIfEvent(dpy, &ev, selector_event, (XPointer)&ov)) {
+            struct pollfd pf = { ConnectionNumber(dpy), POLLIN, 0 };
+            poll(&pf, 1, 100);
+            continue;
+        }
+        if (ev.type == ClientMessage && ev.xclient.message_type == A_CMD) {
+            if (ev.xclient.data.l[0] == CMD_QUIT) quit_req = 1;
+            done = 1;
+            continue;
+        }
+        if (ev.type == Expose && ev.xexpose.count == 0) {
+            old_r.w = 0;
+            old_lab.w = 0;
+            XClearWindow(dpy, ov);
+            need = 1;
+        } else if (ev.type == MotionNotify) {
             while (XCheckTypedWindowEvent(dpy, ov, MotionNotify, &ev)) {}
             int mx = ev.xmotion.x_root, my = ev.xmotion.y_root;
-            if (pressed && !dragging && (abs(mx - sx) > 4 || abs(my - sy) > 4)) dragging = 1;
-            Rect nr;
-            if (dragging) {
-                nr.x = mx < sx ? mx : sx; nr.y = my < sy ? my : sy;
-                nr.w = abs(mx - sx) + 1; nr.h = abs(my - sy) + 1;
-                nr = clip_root(nr);
-            } else if (!pressed) nr = hover_target(mx, my);
-            else nr = cur_r;
+            Rect nr = {0};
+            if (window_mode) nr = hover_window(mx, my);
+            else if (pressed) {
+                nr = clip_root((Rect){ mx < sx ? mx : sx, my < sy ? my : sy,
+                                       abs(mx - sx) + 1, abs(my - sy) + 1 });
+            }
             if (memcmp(&nr, &cur_r, sizeof nr)) { cur_r = nr; need = 1; }
         } else if (ev.type == ButtonPress) {
-            if (ev.xbutton.button == 3) { done = 1; result = 0; }
-            else if (ev.xbutton.button == 1) { pressed = 1; sx = ev.xbutton.x_root; sy = ev.xbutton.y_root; }
+            if (ev.xbutton.button == 3) done = 1;
+            else if (ev.xbutton.button == 1) {
+                pressed = 1;
+                sx = ev.xbutton.x_root;
+                sy = ev.xbutton.y_root;
+            }
         } else if (ev.type == ButtonRelease && ev.xbutton.button == 1 && pressed) {
-            if (!dragging) cur_r = hover_target(ev.xbutton.x_root, ev.xbutton.y_root);
+            int mx = ev.xbutton.x_root, my = ev.xbutton.y_root;
+            if (window_mode) cur_r = hover_window(mx, my);
+            else cur_r = clip_root((Rect){ mx < sx ? mx : sx, my < sy ? my : sy,
+                                           abs(mx - sx) + 1, abs(my - sy) + 1 });
             if (cur_r.w >= 16 && cur_r.h >= 16) { *out = cur_r; result = 1; done = 1; }
-            else { pressed = dragging = 0; }
+            else { pressed = 0; cur_r = (Rect){0}; need = 1; }
         } else if (ev.type == KeyPress) {
             KeySym ks = XLookupKeysym(&ev.xkey, 0);
-            if (ks == XK_Escape) { done = 1; result = 0; }
-            else if ((ks == XK_Return || ks == XK_KP_Enter) && cur_r.w >= 16) { *out = cur_r; result = 1; done = 1; }
+            if (ks == XK_Escape) done = 1;
+            else if ((ks == XK_Return || ks == XK_KP_Enter) && cur_r.w >= 16 && cur_r.h >= 16) {
+                *out = cur_r;
+                result = 1;
+                done = 1;
+            }
         }
     }
-    XUngrabKeyboard(dpy, CurrentTime);
-    XUngrabPointer(dpy, CurrentTime);
+    if (have_keyboard) XUngrabKeyboard(dpy, CurrentTime);
+    if (have_pointer) XUngrabPointer(dpy, CurrentTime);
     XDestroyWindow(dpy, ov);
     XFreeCursor(dpy, cur);
     XFreeGC(dpy, lgc);
@@ -948,6 +1120,7 @@ static void main_show(void) {
     win_redraw(&wmain);
 }
 static void main_hide(void) {
+    startup_since = 0;
     if (!wmain.mapped) return;
     XWithdrawWindow(dpy, wmain.w, scr);
     wmain.mapped = 0;
@@ -965,11 +1138,12 @@ static void borders_show(int x, int y, int w, int h) {
         if (!wborder[i]) {
             XSetWindowAttributes a;
             a.override_redirect = True;
-            a.background_pixel = 0xEE3F35;
+            a.background_pixel = SY_UI_RECORD;
             wborder[i] = XCreateWindow(dpy, root, 0, 0, 10, 10, 0, CopyFromParent, InputOutput, CopyFromParent, CWOverrideRedirect | CWBackPixel, &a);
             set_props(wborder[i], "录制边框", 0);
         }
         XMoveResizeWindow(dpy, wborder[i], rs[i].x, rs[i].y, rs[i].w > 0 ? rs[i].w : 1, rs[i].h > 0 ? rs[i].h : 1);
+        XSetWindowBackground(dpy, wborder[i], SY_UI_RECORD);
         XMapRaised(dpy, wborder[i]);
     }
     borders_on = 1;
@@ -977,6 +1151,122 @@ static void borders_show(int x, int y, int w, int h) {
 static void borders_hide(void) {
     for (int i = 0; i < 4; i++) if (wborder[i]) XUnmapWindow(dpy, wborder[i]);
     borders_on = 0;
+}
+
+/* X Shape 使提示环不会挡住点击，XInput2 给出瞬时按键事件。 */
+typedef Bool (*ShapeVersion)(Display *, int *, int *);
+typedef void (*ShapeRectangles)(Display *, Window, int, int, int, XRectangle *, int, int, int);
+typedef int (*InputVersion)(Display *, int *, int *);
+typedef struct { int deviceid, mask_len; unsigned char *mask; } ClickEventMask;
+typedef int (*InputSelect)(Display *, Window, ClickEventMask *, int);
+static InputSelect click_input_select;
+typedef struct {
+    int type;
+    unsigned long serial;
+    Bool send_event;
+    Display *display;
+    int extension, evtype;
+    Time time;
+    int deviceid, sourceid, detail;
+} RawButtonEvent;
+
+static void click_init(void) {
+    int opcode, event, error, major, minor;
+    if (!XQueryExtension(dpy, "SHAPE", &opcode, &event, &error)) return;
+    click_shape_lib = dlopen("libXext.so.6", RTLD_LAZY | RTLD_LOCAL);
+    if (!click_shape_lib) return;
+    ShapeVersion shape_version = (ShapeVersion)dlsym(click_shape_lib, "XShapeQueryVersion");
+    ShapeRectangles shape_rectangles = (ShapeRectangles)dlsym(click_shape_lib, "XShapeCombineRectangles");
+    if (!shape_version || !shape_rectangles || !shape_version(dpy, &major, &minor) ||
+        major < 1 || (major == 1 && minor == 0)) return;
+
+    int radius = (int)fmin(48, fmax(10, round(P(16))));
+    click_diameter = radius * 2 + 1;
+    XRectangle outline[4 * 48 + 2];
+    int count = 0;
+    int inner = radius - (int)fmax(2, round(P(3)));
+    for (int row = -radius; row <= radius; row++) {
+        int outer_x = (int)sqrt(radius * radius - row * row);
+        int y = row + radius;
+        if (abs(row) >= inner) {
+            outline[count++] = (XRectangle){ radius - outer_x, y, 2 * outer_x + 1, 1 };
+        } else {
+            int inner_x = (int)sqrt(inner * inner - row * row);
+            if (outer_x > inner_x) {
+                outline[count++] = (XRectangle){ radius - outer_x, y, outer_x - inner_x, 1 };
+                outline[count++] = (XRectangle){ radius + inner_x + 1, y, outer_x - inner_x, 1 };
+            }
+        }
+    }
+
+    XSetWindowAttributes attrs = {0};
+    attrs.override_redirect = True;
+    attrs.background_pixel = 0xFFBD42;
+    wclick = XCreateWindow(dpy, root, 0, 0, click_diameter, click_diameter, 0,
+                           CopyFromParent, InputOutput, CopyFromParent,
+                           CWOverrideRedirect | CWBackPixel, &attrs);
+    shape_rectangles(dpy, wclick, ShapeBounding, 0, 0, outline, count, ShapeSet, Unsorted);
+    shape_rectangles(dpy, wclick, ShapeInput, 0, 0, NULL, 0, ShapeSet, Unsorted);
+
+    if (!XQueryExtension(dpy, "XInputExtension", &opcode, &event, &error)) return;
+    click_input_lib = dlopen("libXi.so.6", RTLD_LAZY | RTLD_LOCAL);
+    if (!click_input_lib) return;
+    InputVersion input_version = (InputVersion)dlsym(click_input_lib, "XIQueryVersion");
+    click_input_select = (InputSelect)dlsym(click_input_lib, "XISelectEvents");
+    major = 2;
+    minor = 2;
+    if (input_version && click_input_select && input_version(dpy, &major, &minor) == Success && major >= 2)
+        click_opcode = opcode;
+}
+
+static void click_listen(int active) {
+    if (!click_opcode || active == click_raw_active) return;
+    unsigned char mask[XIMaskLen(XI_RawButtonPress)] = {0};
+    if (active) XISetMask(mask, XI_RawButtonPress);
+    ClickEventMask input_events = { XIAllMasterDevices, sizeof mask, mask };
+    if (click_input_select(dpy, root, &input_events, 1) == Success) click_raw_active = active;
+    else click_opcode = 0;
+}
+
+static void click_show(int x, int y) {
+    if (x < pending_x || y < pending_y || x >= pending_x + pending_w || y >= pending_y + pending_h) return;
+    XMoveWindow(dpy, wclick, x - click_diameter / 2, y - click_diameter / 2);
+    XMapRaised(dpy, wclick);
+    click_until = now_s() + 0.24;
+}
+
+static void click_event(XGenericEventCookie *cookie) {
+    if (cookie->evtype != XI_RawButtonPress || !XGetEventData(dpy, cookie)) return;
+    const RawButtonEvent *event = cookie->data;
+    if (event && event->detail >= 1 && event->detail <= 3 &&
+        rec.state == REC_RUNNING && cfg.click_highlight) {
+        Window rw, cw;
+        int x, y, wx, wy;
+        unsigned int mask;
+        if (XQueryPointer(dpy, root, &rw, &cw, &x, &y, &wx, &wy, &mask)) click_show(x, y);
+    }
+    XFreeEventData(dpy, cookie);
+}
+
+static void click_tick(double now) {
+    if (!wclick) return;
+    int active = rec.state == REC_RUNNING && cfg.click_highlight;
+    click_listen(active);
+    if (click_until && (!active || now >= click_until)) {
+        XUnmapWindow(dpy, wclick);
+        click_until = 0;
+    }
+    if (!active) click_down = 0;
+    else if (!click_opcode) {
+        Window rw, cw;
+        int x, y, wx, wy;
+        unsigned int mask;
+        if (XQueryPointer(dpy, root, &rw, &cw, &x, &y, &wx, &wy, &mask)) {
+            int held = mask & (Button1Mask | Button2Mask | Button3Mask);
+            if (held & ~click_down) click_show(x, y);
+            click_down = held;
+        }
+    }
 }
 
 static void bar_place(int x, int y, int w, int h) {
@@ -1032,7 +1322,7 @@ static void do_start(void) {
     int x = pending_x, y = pending_y, w = pending_w, h = pending_h;
     warn_msg[0] = 0;
     if (rec_begin(dpy, x, y, w, h) != 0) {
-        set_status(rec.err, C_RED);
+        set_status(rec.err, STATUS_ERROR);
         main_show();
         return;
     }
@@ -1048,25 +1338,75 @@ static void do_start(void) {
     XFlush(dpy);
 }
 
-static void request_start(void) {
-    if (rec.state != REC_IDLE || counting) return;
-    if (cfg.area == AREA_REGION && (cfg.rw <= 0 || cfg.rh <= 0)) {
-        select_then_start = 1;
-        return;          /* 主循环里执行框选（需先隐藏主窗口） */
+static int capture_busy(void) {
+    return counting || shot || rec.state != REC_IDLE;
+}
+
+static void do_shot(void) {
+    SyPlan plan = {0};
+    plan.x = pending_x; plan.y = pending_y; plan.w = pending_w; plan.h = pending_h;
+    plan.thumbnail = cfg.show_thumbnail;
+    snprintf(plan.outdir, sizeof plan.outdir, "%s", cfg.outdir);
+    snprintf(plan.display, sizeof plan.display, "%s", DisplayString(dpy));
+    SyStatus status = {0};
+    if (sy_shot_begin(&shot, &plan, ffmpeg_path(), &ui_caps, &status) != SY_OK) {
+        set_status(status.err[0] ? status.err : "无法开始截图", STATUS_ERROR);
+        main_show();
     }
+}
+
+static void remember_region(Rect r) {
+    cfg.rx = r.x; cfg.ry = r.y; cfg.rw = r.w; cfg.rh = r.h;
+}
+
+static int choose_target(int area, Rect *r, int force_region) {
+    mons_refresh(dpy);
+    if (area == AREA_SCREEN || (area == AREA_REGION && !force_region && cfg.remember_selection)) {
+        target_rect(area, &r->x, &r->y, &r->w, &r->h);
+        if (r->w >= 16 && r->h >= 16) return 1;
+        if (area == AREA_SCREEN) return 0;
+    }
+    main_hide();
+    XSync(dpy, False);
+    usleep(200000);          /* 等待合成器完成收起动画 */
+    return run_selector(area, r);
+}
+
+static void request_capture(int area, int is_shot) {
+    if (capture_busy()) return;
+    if (!ffmpeg_path()) {
+        set_status("找不到录制引擎（录制引擎/ffmpeg），请保持程序目录完整", STATUS_ERROR);
+        win_redraw(&wmain);
+        return;
+    }
+    Rect r;
+    if (!choose_target(area, &r, 0)) { if (!quit_req) main_show(); return; }
+    if (area == AREA_REGION && cfg.remember_selection) remember_region(r);
+    if (!is_shot) cfg.area = area;
     seg_focus = 0;
     clamp_seg();
     cfg_save();
-    mons_refresh(dpy);
-    target_rect(&pending_x, &pending_y, &pending_w, &pending_h);
-    if (pending_w < 16 || pending_h < 16) { set_status("录制区域无效，请重新框选", C_RED); return; }
+    shot_result[0] = 0;
+    warn_msg[0] = 0;
+    status_msg[0] = 0;
+    resize_main();
+    pending_x = r.x; pending_y = r.y; pending_w = r.w; pending_h = r.h;
+    pending_is_shot = is_shot;
     main_hide();
     bar_hidden = 0;
     rec.err[0] = 0;
     counting = 1;
-    cd_until = now_s() + (cfg.countdown > 0 ? cfg.countdown : 0);
-    if (cfg.countdown > 0) cd_show(pending_x, pending_y, pending_w, pending_h);
+    cd_until = now_s() + cfg.countdown;
+    if (cfg.countdown > 0) cd_show(r.x, r.y, r.w, r.h);
     pending_start_at = 0;
+}
+
+static void request_start(void) {
+    request_capture(cfg.area, 0);
+}
+
+static void activate_mode(void) {
+    request_capture(mode_area(cfg.mode), cfg.mode < SY_RECORD_SCREEN);
 }
 
 static void cancel_countdown(void) {
@@ -1082,7 +1422,7 @@ static void request_stop(void) {
     rec_stop();
     bar_hide();
     borders_hide();
-    set_status("", C_TEXT);
+    set_status("", STATUS_TEXT);
     main_show();
 }
 
@@ -1092,35 +1432,54 @@ static void toggle_pause(void) {
     if (wbar.mapped) win_redraw(&wbar);
 }
 
-static void do_select(int then_start) {
-    int was = wmain.mapped;
-    main_hide();
-    XSync(dpy, False);
-    usleep(250000);          /* 等待窗口管理器收起主窗口 */
+static void reselect_region(void) {
     Rect r;
-    if (run_selector(&r)) {
-        cfg.area = AREA_REGION;
-        cfg.rx = r.x; cfg.ry = r.y; cfg.rw = r.w & ~1; cfg.rh = r.h & ~1;
+    if (choose_target(AREA_REGION, &r, 1)) {
+        remember_region(r);
         cfg_save();
-        if (then_start) { request_start(); return; }
     }
-    if (was || !then_start) main_show();
-    else main_show();
+    if (!quit_req) main_show();
+}
+
+static void choose_mode(int mode, int using_keyboard) {
+    cfg.mode = mode;
+    if (mode >= SY_RECORD_SCREEN) cfg.area = mode_area(mode);
+    if (using_keyboard) { nav_id = H_MODE; nav_arg = mode; }
+    status_msg[0] = 0;
+    warn_msg[0] = 0;
+    shot_result[0] = 0;
+    cfg_save();
+    resize_main();
+    win_redraw(&wmain);
 }
 
 /* ---------------- 点击处理 ---------------- */
 static void on_click(Win *w, int id, int arg) {
     if (w == &wmain) {
-        if ((rec.state != REC_IDLE || counting) && id != H_OPEN_DIR && id != H_RES_PLAY && id != H_RES_DIR) return;
+        if (capture_busy() && id != H_OPEN_DIR && id != H_RES_PLAY && id != H_THEME) return;
         if (id != H_SEG && seg_focus) { seg_focus = 0; clamp_seg(); }
         switch (id) {
-        case H_AREA:
-            cfg.area = arg;
-            if (arg == AREA_REGION && cfg.rw <= 0) { cfg_save(); do_select(0); return; }
+        case H_MODE: choose_mode(arg, 0); return;
+        case H_THEME:
+            cfg.theme = !cfg.theme;
+            XSetWindowBackground(dpy, wmain.w, SY_UI_BG);
+            if (wpick.mapped) win_redraw(&wpick);
             break;
+        case H_SETTINGS:
+            settings_open = !settings_open;
+            resize_main();
+            win_redraw(&wmain);
+            return;
         case H_MON_PREV: cfg.monitor = cfg.monitor <= -1 ? g_nmons - 1 : cfg.monitor - 1; break;
         case H_MON_NEXT: cfg.monitor = cfg.monitor >= g_nmons - 1 ? -1 : cfg.monitor + 1; break;
-        case H_RESELECT: do_select(0); return;
+        case H_RESELECT: reselect_region(); return;
+        case H_REMEMBER:
+            cfg.remember_selection = !cfg.remember_selection;
+            if (!cfg.remember_selection) cfg.rx = cfg.ry = cfg.rw = cfg.rh = 0;
+            break;
+        case H_DESKTOP_COPY: cfg.desktop_copy = !cfg.desktop_copy; break;
+        case H_THUMBNAIL: cfg.show_thumbnail = !cfg.show_thumbnail; break;
+        case H_CLICK_HIGHLIGHT: cfg.click_highlight = !cfg.click_highlight; break;
         case H_AUDIO:
             if (arg >= 0 && arg < n_aud) {
                 cfg.audio = ui_aud[arg].id;
@@ -1128,9 +1487,9 @@ static void on_click(Win *w, int id, int arg) {
                 dev_i = -1;
                 audio_before = cfg.audio;
             }
-            if (cfg.audio != SY_AUDIO_SILENCE && !audio_available()) set_status(audio_error(), C_ORANGE);
+            if (cfg.audio != SY_AUDIO_SILENCE && !audio_available()) set_status(audio_error(), STATUS_WARN);
             break;
-        case H_FPS: { static const int f[] = { 10, 15, 24, 30 }; cfg.fps = f[arg]; break; }
+        case H_FPS: cfg.fps = fps_values[arg]; break;
         case H_QUAL: cfg.quality = arg; break;
         case H_SCALE: cfg.scale = arg; break;
         case H_FMT: if (arg >= 0 && arg < n_cont) cfg.fmt = ui_cont[arg].id; break;
@@ -1149,9 +1508,8 @@ static void on_click(Win *w, int id, int arg) {
         case H_DEV_NEXT: cycle_dev(1); break;
         case H_OPEN_DIR: mkdir_p(cfg.outdir); open_path(cfg.outdir); return;
         case H_CHANGE_DIR: pick_open(); return;
-        case H_START: request_start(); return;
-        case H_RES_PLAY: if (rec.result[0]) open_path(rec.result); return;
-        case H_RES_DIR: open_path(cfg.outdir); return;
+        case H_START: activate_mode(); return;
+        case H_RES_PLAY: if (shot_result[0]) open_path(shot_result); else if (rec.result[0]) open_path(rec.result); return;
         }
         cfg_save();
         win_redraw(&wmain);
@@ -1189,11 +1547,11 @@ static void on_click(Win *w, int id, int arg) {
         }
         case H_PK_CANCEL: pick_close(); return;
         case H_PK_OK:
-            if (access(pk_dir, W_OK) != 0) { set_status("该目录没有写入权限，请换一个目录", C_RED); pick_close(); win_redraw(&wmain); return; }
+            if (access(pk_dir, W_OK) != 0) { set_status("该目录没有写入权限，请换一个目录", STATUS_ERROR); pick_close(); win_redraw(&wmain); return; }
             snprintf(cfg.outdir, sizeof cfg.outdir, "%s", pk_dir);
             cfg_save();
             pick_close();
-            set_status("", C_TEXT);
+            set_status("", STATUS_TEXT);
             win_redraw(&wmain);
             return;
         }
@@ -1226,12 +1584,10 @@ static void grab_keys(void) {
     hotkey_conflict = grab_failed;
 }
 
-enum { CMD_SHOW = 1, CMD_TOGGLE = 2, CMD_PAUSE = 3, CMD_STOP = 4, CMD_QUIT = 5 };
-
 static void handle_cmd(int c) {
     switch (c) {
     case CMD_SHOW:
-        if (counting) break;
+        if (counting || shot) break;
         if (rec.state == REC_IDLE || rec.state == REC_SAVING) main_show();
         else if (bar_hidden) { bar_hidden = 0; bar_show(); }
         break;
@@ -1265,7 +1621,50 @@ static void find_hit(Win *w, int x, int y, int *id, int *arg) {
     }
 }
 
+static int main_key(XKeyEvent *ev) {
+    KeySym key = XLookupKeysym(ev, 0);
+    if (key == XK_Return || key == XK_KP_Enter || key == XK_space) {
+        if (nav_id) on_click(&wmain, nav_id, nav_arg);
+        else activate_mode();
+        return 1;
+    }
+    if (key == XK_Left || key == XK_Right) {
+        int step = key == XK_Left ? SY_MODE_COUNT - 1 : 1;
+        choose_mode((cfg.mode + step) % SY_MODE_COUNT, 1);
+        return 1;
+    }
+    if (key == XK_Tab && wmain.nh) {
+        int back = ev->state & ShiftMask;
+        int i = back ? wmain.nh - 1 : 0;
+        for (int j = 0; j < wmain.nh; j++) {
+            const Hit *hit = &wmain.hits[j];
+            if (hit->id == nav_id && hit->arg == nav_arg) {
+                i = (j + (back ? wmain.nh - 1 : 1)) % wmain.nh;
+                break;
+            }
+        }
+        nav_id = wmain.hits[i].id;
+        nav_arg = wmain.hits[i].arg;
+        win_redraw(&wmain);
+        return 1;
+    }
+    if ((key == XK_Escape && settings_open) || key == XK_F2) {
+        on_click(&wmain, H_SETTINGS, 0);
+        return 1;
+    }
+    return 0;
+}
+
 static void handle_event(XEvent *ev) {
+    if (startup_since && ev->type == KeyPress && ev->xkey.window == wmain.w) {
+        startup_since = 0;
+        win_redraw(&wmain);
+        if (XLookupKeysym(&ev->xkey, 0) == XK_Escape) return;
+    }
+    if (ev->type == GenericEvent && ev->xcookie.extension == click_opcode && click_opcode) {
+        click_event(&ev->xcookie);
+        return;
+    }
     if (ev->type == KeyPress && (ev->xkey.state & ControlMask) && (ev->xkey.state & Mod1Mask)) {
         KeyCode k = ev->xkey.keycode;
         if (k == kc_r) { handle_cmd(CMD_TOGGLE); return; }
@@ -1301,11 +1700,12 @@ static void handle_event(XEvent *ev) {
         }
         return;
     }
+    if (ev->type == KeyPress && ev->xkey.window == wmain.w && !capture_busy() && main_key(&ev->xkey)) return;
     if (ev->type == ClientMessage) {
         if (ev->xclient.message_type == A_CMD) { handle_cmd((int)ev->xclient.data.l[0]); return; }
         if (ev->xclient.message_type == A_PROTO && (Atom)ev->xclient.data.l[0] == A_DEL) {
             if (ev->xclient.window == wmain.w) {
-                if (rec.state == REC_SAVING) { set_status("正在保存，完成后再关闭", C_ORANGE); win_redraw(&wmain); }
+                if (rec.state == REC_SAVING || shot) { set_status("正在保存，完成后再关闭", STATUS_WARN); win_redraw(&wmain); }
                 else quit_req = 1;
             } else if (wpick.w && ev->xclient.window == wpick.w) pick_close();
             return;
@@ -1340,6 +1740,11 @@ static void handle_event(XEvent *ev) {
             break;
         }
         if (ev->xbutton.button != 1) break;
+        if (w == &wmain && (nav_id || startup_since)) {
+            nav_id = 0;
+            startup_since = 0;
+            win_redraw(w);
+        }
         find_hit(w, ev->xbutton.x, ev->xbutton.y, &w->prs, &w->prsa);
         if (w == &wbar && !w->prs) {
             Window ch; int bx, by;
@@ -1365,12 +1770,28 @@ static void handle_event(XEvent *ev) {
 static double last_bar;
 static void tick(void) {
     double t = now_s();
+    if (startup_since && t >= next_intro_frame) {
+        if (t - startup_since >= SY_INTRO_SECONDS) startup_since = 0;
+        next_intro_frame = t + SY_INTRO_FRAME_MS / 1000.0;
+        if (wmain.mapped) {
+            int width = (int)ceil(P(SY_INTRO_WIDTH)), height = (int)ceil(P(SY_INTRO_HEIGHT));
+            fill_rect(wmain.s, 0, 0, width, height, C_BG);
+            draw_brand(wmain.s);
+            XPutImage(dpy, wmain.w, wmain.gc, wmain.img, 0, 0, 0, 0, width, height);
+        }
+    }
     rec_poll();
+    click_tick(t);
     if (counting) {
         if (t >= cd_until) {
             if (wcd.mapped) { cd_hide(); XSync(dpy, False); pending_start_at = t + 0.3; }
             else if (!pending_start_at) pending_start_at = t + 0.35;
-            if (t >= pending_start_at) { pending_start_at = 0; counting = 0; do_start(); }
+            if (t >= pending_start_at) {
+                pending_start_at = 0;
+                counting = 0;
+                if (pending_is_shot) do_shot();
+                else do_start();
+            }
         } else if (wcd.mapped) win_redraw(&wcd);
     }
     if ((rec.state == REC_RUNNING || rec.state == REC_PAUSED) && wbar.mapped && t - last_bar > 0.1) {
@@ -1391,17 +1812,37 @@ static void tick(void) {
             else snprintf(msg, sizeof msg, "已保存 %s（%s，%.1f MB）", base, d1, rec.result_size_mb);
             if (rec.warn[0]) snprintf(msg + strlen(msg), sizeof msg - strlen(msg), "　%s", rec.warn);
             if (rec.err[0]) snprintf(msg + strlen(msg), sizeof msg - strlen(msg), "　注意：%s", rec.err);
-            set_status(msg, rec.err[0] ? C_ORANGE : C_GREEN);
-            if (rec.err[0]) status_col = C_GREEN;   /* 仍显示播放链接 */
-        } else set_status(rec.err[0] ? rec.err : "保存失败", C_RED);
+            set_status(msg, STATUS_SUCCESS);
+        } else set_status(rec.err[0] ? rec.err : "保存失败", STATUS_ERROR);
         main_show();
         win_redraw(&wmain);
     }
     if (ui_state_prev != rec.state && wmain.mapped) win_redraw(&wmain);
     ui_state_prev = rec.state;
-    if (select_then_start) {
-        select_then_start = 0;
-        do_select(1);
+    if (shot) {
+        SyStatus status;
+        if (sy_shot_poll(shot, &status)) {
+            shot_preview_w = shot_preview_h = 0;
+            int pw, ph;
+            const unsigned char *pixels = sy_shot_preview(shot, &pw, &ph);
+            if (pixels && pw > 0 && pw <= 180 && ph > 0 && ph <= 104) {
+                memcpy(shot_preview, pixels, (size_t)pw * ph * sizeof *shot_preview);
+                shot_preview_w = pw;
+                shot_preview_h = ph;
+            }
+            sy_shot_close(shot);
+            shot = NULL;
+            if (status.last_file[0]) {
+                snprintf(shot_result, sizeof shot_result, "%s", status.last_file);
+                const char *base = strrchr(shot_result, '/');
+                char message[1400];
+                snprintf(message, sizeof message, "已保存 %s", base ? base + 1 : shot_result);
+                set_status(message, STATUS_SUCCESS);
+            } else set_status(status.err[0] ? status.err : "截图保存失败", STATUS_ERROR);
+            resize_main();
+            main_show();
+            win_redraw(&wmain);
+        }
     }
 }
 
@@ -1454,7 +1895,7 @@ static void exe_dir(void) {
 /* 自检：在目标机终端运行 shiying --check，逐项列出运行条件 */
 static int self_check(void) {
     int bad = 0;
-    printf("拾影录屏 %s 自检\n程序目录：%s\n", APP_VERSION, g_exe_dir);
+    printf(APP_NAME " %s 自检\n程序目录：%s\n", APP_VERSION, g_exe_dir);
     const char *ff = ffmpeg_path();
     printf("[%s] 录制引擎：%s\n", ff ? "通过" : "失败", ff ? ff : "未找到 录制引擎/ffmpeg");
     if (!ff) bad++;
@@ -1496,7 +1937,7 @@ static int self_check(void) {
 }
 
 static void usage(void) {
-    printf("拾影录屏 %s\n用法：拾影录屏 [--toggle|--pause|--stop|--show|--quit|--version]\n"
+    printf(APP_NAME " %s\n用法：" APP_NAME " [--toggle|--pause|--stop|--show|--quit|--version]\n"
            "  --toggle  开始/停止录制（可绑定到系统自定义快捷键）\n"
            "  --pause   暂停/继续\n  --stop    停止并保存\n  --check   运行环境自检\n", APP_VERSION);
 }
@@ -1561,6 +2002,10 @@ int main(int argc, char **argv) {
     has_argb = has_comp && XMatchVisualInfo(dpy, scr, 32, TrueColor, &argb_vi);
     cfg_load();
     mons_refresh(dpy);
+    if (g_nmons > 0) {
+        const Mon *primary = &g_mons[0];
+        S = fmin(S, fmin(primary->w / (MAIN_W + 24.0), primary->h / (MAIN_SETTINGS_H + 80.0)));
+    }
     logf_("start v%s exe=%s scale=%.2f comp=%d mons=%d font=%s ffmpeg=%s", APP_VERSION, g_exe_dir, S, has_comp, g_nmons, font_path(),
           ffmpeg_path() ? ffmpeg_path() : "(none)");
 
@@ -1571,7 +2016,7 @@ int main(int argc, char **argv) {
     XSetSelectionOwner(dpy, A_SINGLE, wmain.w, CurrentTime);
     load_caps();
     /* 控制条 */
-    win_create(&wbar, 0, 0, (int)P(BAR_W), (int)P(BAR_H), 1, 0, "拾影录屏 · 录制中", A_T_DOCK);
+    win_create(&wbar, 0, 0, (int)P(BAR_W), (int)P(BAR_H), 1, 0, APP_NAME " · 录制中", A_T_DOCK);
     wbar.draw = draw_bar;
     no_decor(wbar.w);
     no_focus(wbar.w);
@@ -1581,10 +2026,14 @@ int main(int argc, char **argv) {
     wcd.draw = draw_cd;
 
     grab_keys();
-    if (!ffmpeg_path()) set_status("找不到录制引擎（录制引擎/ffmpeg），请保持程序目录完整", C_RED);
+    click_init();
+    if (!ffmpeg_path()) set_status("找不到录制引擎（录制引擎/ffmpeg），请保持程序目录完整", STATUS_ERROR);
     if (rec_recover()) ui_state_prev = REC_SAVING;
     if (cmd == CMD_TOGGLE) request_start();
-    else main_show();
+    else {
+        startup_since = now_s();
+        main_show();
+    }
 
     int xfd = ConnectionNumber(dpy);
     while (1) {
@@ -1596,15 +2045,23 @@ int main(int argc, char **argv) {
         if (quit_req) {
             if (counting) { counting = 0; pending_start_at = 0; cd_hide(); }
             else if (rec.state == REC_RUNNING || rec.state == REC_PAUSED) request_stop();
-            if (!counting && rec.state == REC_IDLE) break;
+            if (!counting && !shot && rec.state == REC_IDLE) break;
         }
-        int busy = counting || rec.state != REC_IDLE || wbar.mapped;
+        int busy = counting || shot || rec.state != REC_IDLE || wbar.mapped;
         struct pollfd pf = { xfd, POLLIN, 0 };
-        poll(&pf, 1, busy ? 50 : 400);
+        int timeout = busy ? 50 : 1000;
+        if (startup_since) {
+            int frame_ms = (int)ceil((next_intro_frame - now_s()) * 1000);
+            if (frame_ms < 0) frame_ms = 0;
+            if (frame_ms < timeout) timeout = frame_ms;
+        }
+        poll(&pf, 1, timeout);
         tick();
         XFlush(dpy);
     }
     cfg_save();
     XCloseDisplay(dpy);
+    if (click_input_lib) dlclose(click_input_lib);
+    if (click_shape_lib) dlclose(click_shape_lib);
     return 0;
 }

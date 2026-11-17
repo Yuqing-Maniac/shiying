@@ -1,49 +1,55 @@
-# 生成程序图标：PNG（桌面文件用）＋ C 头文件（_NET_WM_ICON 与界面内绘制用）
-from PIL import Image, ImageDraw, ImageFilter
-import sys, os
-out = sys.argv[1]
-def make(S):
-    k = 4; N = S*k
-    im = Image.new("RGBA", (N, N), (0,0,0,0))
-    d = ImageDraw.Draw(im)
-    # 渐变底：深蓝→亮蓝
-    grad = Image.new("RGBA", (N, N))
-    gd = ImageDraw.Draw(grad)
-    for y in range(N):
-        t = y/(N-1)
-        c = (int(30+(55-30)*t), int(96+(144-96)*t), int(210+(250-210)*t), 255)
-        gd.line([(0,y),(N,y)], fill=c)
-    mask = Image.new("L", (N,N), 0)
-    m = ImageDraw.Draw(mask)
-    pad = int(N*0.06); r = int(N*0.22)
-    m.rounded_rectangle([pad,pad,N-pad,N-pad], radius=r, fill=255)
-    im.paste(grad, (0,0), mask)
-    # 屏幕框
-    sx0, sy0, sx1, sy1 = int(N*0.20), int(N*0.25), int(N*0.80), int(N*0.68)
-    d.rounded_rectangle([sx0,sy0,sx1,sy1], radius=int(N*0.06), outline=(255,255,255,255), width=int(N*0.055))
-    # 底座
-    d.rounded_rectangle([int(N*0.38), int(N*0.74), int(N*0.62), int(N*0.79)], radius=int(N*0.025), fill=(255,255,255,235))
-    # 录制红点（白圈）
-    cx, cy, rr = int(N*0.50), int(N*0.465), int(N*0.115)
-    d.ellipse([cx-rr-int(N*0.03), cy-rr-int(N*0.03), cx+rr+int(N*0.03), cy+rr+int(N*0.03)], fill=(255,255,255,255))
-    d.ellipse([cx-rr, cy-rr, cx+rr, cy+rr], fill=(240,65,52,255))
-    return im.resize((S,S), Image.LANCZOS)
-os.makedirs(out, exist_ok=True)
-for S in (16,24,32,48,64,128,256):
-    make(S).save(f"{out}/shiying-{S}.png")
-make(256).save(f"{out}/shiying.png")
-with open(f"{out}/icon_data.h","w") as f:
-    f.write("/* 自动生成：tools/mkicon.py */\n")
-    for S in (32,48,64):
-        im = make(S); px = im.load()
-        vals = []
-        for y in range(S):
-            for x in range(S):
-                r,g,b,a = px[x,y]
-                # 预乘 alpha，便于界面直接合成
-                vals.append((a<<24)|((r*a//255)<<16)|((g*a//255)<<8)|(b*a//255))
-        f.write(f"static const unsigned int ICON{S}[{S*S}] = {{\n")
-        for i in range(0,len(vals),8):
-            f.write("  "+",".join(f"0x{v:08x}u" for v in vals[i:i+8])+",\n")
-        f.write("};\n")
-print("ok")
+"""从主 PNG 生成桌面图标、原生窗口像素数据和可选的 Windows 图标。"""
+
+from argparse import ArgumentParser
+from pathlib import Path
+
+from PIL import Image
+
+
+SIZES = (16, 24, 32, 48, 64, 128, 256)
+MASTER = Path(__file__).resolve().parents[1] / "assets" / "shiying.png"
+
+
+def write_header(path, icons):
+    with path.open("w", encoding="utf-8", newline="\n") as header:
+        header.write("/* 自动生成：build/mkicon.py */\n")
+        for size in (32, 48, 64):
+            values = []
+            rgba = icons[size].tobytes()
+            for r, g, b, alpha in zip(rgba[::4], rgba[1::4], rgba[2::4], rgba[3::4]):
+                pixel = (alpha << 24) | (r * alpha // 255 << 16) | (g * alpha // 255 << 8) | (b * alpha // 255)
+                values.append(f"0x{pixel:08x}u")
+            header.write(f"static const unsigned int ICON{size}[{size * size}] = {{\n")
+            for offset in range(0, len(values), 8):
+                header.write("  " + ",".join(values[offset:offset + 8]) + ",\n")
+            header.write("};\n")
+
+
+def main():
+    parser = ArgumentParser(description=__doc__)
+    parser.add_argument("directory", type=Path, help="PNG 和 C 头文件输出目录")
+    parser.add_argument("--source", type=Path, default=MASTER, help="替换主 PNG")
+    parser.add_argument("--ico", type=Path, help="Windows ICO 输出路径")
+    args = parser.parse_args()
+
+    with Image.open(args.source) as original:
+        if original.width != original.height or original.width < max(SIZES):
+            parser.error("主 PNG 必须为边长至少 256 像素的正方形")
+        master = original.convert("RGBA")
+
+    args.directory.mkdir(parents=True, exist_ok=True)
+    icons = {size: master.resize((size, size), Image.Resampling.LANCZOS) for size in SIZES}
+    for size, icon in icons.items():
+        icon.save(args.directory / f"shiying-{size}.png")
+    png = args.directory / "shiying.png"
+    if png.resolve() != args.source.resolve():
+        icons[256].save(png)
+    write_header(args.directory / "icon_data.h", icons)
+
+    if args.ico:
+        args.ico.parent.mkdir(parents=True, exist_ok=True)
+        master.save(args.ico, format="ICO", sizes=[(size, size) for size in SIZES])
+
+
+if __name__ == "__main__":
+    main()

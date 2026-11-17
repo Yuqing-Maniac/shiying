@@ -1,4 +1,4 @@
-# 拾影录屏：在 Releases 页面发布标签为 shiying-vX.Y.Z 的版本后，从零构建全部发布包并挂到该版本下
+# 映刻录屏：在 Releases 页面发布标签为 shiying-vX.Y.Z 的版本后，从零构建全部发布包并挂到该版本下
 name: shiying-release
 on:
   release:
