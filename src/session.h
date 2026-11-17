@@ -55,6 +55,7 @@ typedef enum {
 } SyHold;
 
 typedef struct SySession SySession;
+typedef struct SyShot SyShot;
 
 typedef struct {
     int h264;
@@ -66,6 +67,7 @@ typedef struct {
     int grab_dda;
     int cursor_mag;
     int audio_ok;
+    int png;
 } SyCaps;
 
 typedef struct {
@@ -91,6 +93,8 @@ typedef struct {
     char display[256];
     char outdir[1024];
     uint64_t limit_bytes;
+    int desktop_copy;
+    int thumbnail;
 } SyPlan;
 
 typedef struct {
@@ -124,6 +128,14 @@ void sy_session_stop(SySession *s);
 void sy_session_poll(SySession *s);
 void sy_session_status(const SySession *s, SyStatus *st);
 void sy_session_close(SySession *s);
+
+int sy_shot_begin(SyShot **out, const SyPlan *plan, const char *ffmpeg,
+                  const SyCaps *caps, SyStatus *st);
+/* 尚未完成时返回 0，完成时返回 1，并在 st 中提供结果或错误。 */
+int sy_shot_poll(SyShot *shot, SyStatus *st);
+/* 可选缩略图为连续 BGRA 像素，缓冲区由 SyShot 持有。 */
+const unsigned char *sy_shot_preview(const SyShot *shot, int *w, int *h);
+void sy_shot_close(SyShot *shot);
 
 int sy_recover(const char *outdir, const char *ffmpeg, SySession **out, SyStatus *st);
 

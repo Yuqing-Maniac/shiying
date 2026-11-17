@@ -7,6 +7,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,9 +17,11 @@
 #ifndef SHIYING_WIN
 #include <unistd.h>
 #include <sys/statvfs.h>
+#include <pthread.h>
 #include "audio.h"
 #else
 #include <io.h>
+#include <process.h>
 #include <unistd.h>
 #ifndef F_OK
 #define F_OK 0
@@ -27,7 +30,7 @@
 #endif
 #endif
 
-enum { ARG_N = 96, ARG_L = 512 };
+enum { ARG_N = 96, ARG_L = 1600 };
 enum { SLOT_EMPTY = 0, SLOT_FLUSH = 1, SLOT_REMUX = 2 };
 
 typedef struct { char b[ARG_N][ARG_L]; int n; } ArgBuf;
@@ -45,6 +48,31 @@ static void apf(ArgBuf *a, const char *fmt, ...) {
     va_end(v);
     a->n++;
 }
+
+typedef struct BackupJob {
+    struct BackupJob *next;
+    char source[1200];
+    char desktop[1200];
+    atomic_int done;
+    int failed;
+#ifdef SHIYING_WIN
+    uintptr_t worker;
+#else
+    pthread_t worker;
+#endif
+} BackupJob;
+
+struct SyShot {
+    int pid;
+    int done;
+    int preview_w, preview_h;
+    double started;
+    char dest[1200];
+    char partial[1280];
+    char preview[1280];
+    unsigned char *pixels;
+    SyStatus status;
+};
 
 struct SySession {
     SyPlan plan;
@@ -64,10 +92,11 @@ struct SySession {
     SyHold hold;
     int want_resume, audio_on, audio_started, recovered, sealed_count;
     int list_pending, commit_final, then_final, recovering;
-    int live_pid, slot_pid, slot_kind, slot_killed, media_ok;
+    int live_pid, live_start_failed, slot_pid, slot_kind, slot_killed, media_ok;
     double t_accum, t_seg, slot_since, last_dur;
     uint64_t last_bytes;
     int grab, audio_route;
+    BackupJob *backup_first, *backup_last;
 };
 
 static SySession *live_sess;
@@ -194,12 +223,13 @@ static void write_target(SySession *s) {
     snprintf(p, sizeof p, "%s/target.txt", s->tmpdir);
     FILE *f = fopen(p, "w");
     if (!f) return;
-    fprintf(f, "%s\ncodec=%d\ncontainer=%d\n", dest, (int)s->plan.codec, (int)s->plan.container);
+    fprintf(f, "%s\ncodec=%d\ncontainer=%d\ndesktop_copy=%d\n", dest,
+            (int)s->plan.codec, (int)s->plan.container, s->plan.desktop_copy);
     file_fsync(f);
     fclose(f);
 }
 
-static void read_target_file(const char *dir, char *dest, size_t nd, int *codec, int *container) {
+static void read_target_file(const char *dir, char *dest, size_t nd, int *codec, int *container, int *desktop_copy) {
     char p[1500], line[1200];
     snprintf(p, sizeof p, "%s/target.txt", dir);
     FILE *f = fopen(p, "r");
@@ -211,6 +241,7 @@ static void read_target_file(const char *dir, char *dest, size_t nd, int *codec,
     while (fgets(line, sizeof line, f)) {
         if (codec && !strncmp(line, "codec=", 6)) *codec = atoi(line + 6);
         if (container && !strncmp(line, "container=", 10)) *container = atoi(line + 10);
+        if (desktop_copy && !strncmp(line, "desktop_copy=", 13)) *desktop_copy = atoi(line + 13) != 0;
     }
     fclose(f);
 }
@@ -242,7 +273,7 @@ static int list_dest(const char *list, char *dest, size_t n) {
     return dest[0] ? 0 : -1;
 }
 
-static int write_concat(const SySession *s, const char *list, const char *concat) {
+static int write_concat(const char *list, const char *concat) {
     FILE *in = fopen(list, "r");
     FILE *out = fopen(concat, "w");
     if (!in || !out) { if (in) fclose(in); if (out) fclose(out); return -1; }
@@ -252,7 +283,8 @@ static int write_concat(const SySession *s, const char *list, const char *concat
         line[strcspn(line, "\r\n")] = 0;
         if (first) { first = 0; continue; }
         if (!line[0] || strchr(line, '=')) continue;
-        fprintf(out, "file '%s/%s'\n", s->tmpdir, line);
+        /* 列表与分段在同一目录，ffmpeg 按列表所在目录解析相对文件名。 */
+        fprintf(out, "file '%s'\n", line);
         n++;
     }
     file_fsync(out);
@@ -282,11 +314,187 @@ static void unlink_listed(SySession *s, const char *list) {
     unlink(c);
 }
 
+/* 提交同目录的临时文件，避免覆盖同名的现有成品。 */
+static int publish_file(const char *partial, const char *dest) {
+#ifdef SHIYING_WIN
+    wchar_t wp[1280], wd[1280];
+    if (widen(partial, wp, 1280) != 0 || widen(dest, wd, 1280) != 0) return -1;
+    if (MoveFileW(wp, wd)) return 0;
+    DWORD err = GetLastError();
+    return err == ERROR_ALREADY_EXISTS || err == ERROR_FILE_EXISTS ? 1 : -1;
+#else
+    if (link(partial, dest) == 0) { unlink(partial); return 0; }
+    if (errno == EEXIST) return 1;
+    if (errno != EPERM && errno != EOPNOTSUPP && errno != ENOSYS) return -1;
+    /* 部分便携盘不支持硬链接。 */
+    struct stat st;
+    if (lstat(dest, &st) == 0) return 1;
+    return rename(partial, dest) == 0 ? 0 : -1;
+#endif
+}
+
+static int same_file(const char *left, const char *right) {
+#ifdef SHIYING_WIN
+    wchar_t wl[1200], wr[1200];
+    if (widen(left, wl, 1200) != 0 || widen(right, wr, 1200) != 0) return 0;
+    const DWORD share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+    HANDLE a = CreateFileW(wl, 0, share, NULL, OPEN_EXISTING, 0, NULL);
+    HANDLE b = CreateFileW(wr, 0, share, NULL, OPEN_EXISTING, 0, NULL);
+    BY_HANDLE_FILE_INFORMATION ai, bi;
+    int same = a != INVALID_HANDLE_VALUE && b != INVALID_HANDLE_VALUE
+        && GetFileInformationByHandle(a, &ai) && GetFileInformationByHandle(b, &bi)
+        && ai.dwVolumeSerialNumber == bi.dwVolumeSerialNumber
+        && ai.nFileIndexHigh == bi.nFileIndexHigh && ai.nFileIndexLow == bi.nFileIndexLow;
+    if (a != INVALID_HANDLE_VALUE) CloseHandle(a);
+    if (b != INVALID_HANDLE_VALUE) CloseHandle(b);
+    return same;
+#else
+    struct stat a, b;
+    return stat(left, &a) == 0 && stat(right, &b) == 0
+        && a.st_dev == b.st_dev && a.st_ino == b.st_ino;
+#endif
+}
+
+static int reserve_partial(char *partial, size_t n, const char *path) {
+    for (unsigned i = 0; i < 100; i++) {
+        int len = snprintf(partial, n, "%s.%u.%u.partial", path, (unsigned)getpid(), i);
+        if (len < 0 || (size_t)len >= n) break;
+#ifdef SHIYING_WIN
+        int fd = open(partial, O_WRONLY | O_CREAT | O_EXCL | O_BINARY, 0600);
+#else
+        int fd = open(partial, O_WRONLY | O_CREAT | O_EXCL, 0600);
+#endif
+        if (fd >= 0) return fd;
+        if (errno != EEXIST) break;
+    }
+    partial[0] = 0;
+    return -1;
+}
+
+static int backup_copy(const BackupJob *job) {
+    const char *base = strrchr(job->source, '/');
+    base = base ? base + 1 : job->source;
+    char dest[1200], partial[1280];
+    int len = snprintf(dest, sizeof dest, "%s/%s", job->desktop, base);
+    if (len < 0 || (size_t)len >= sizeof dest) return -1;
+    if (same_file(job->source, dest)) return 0;
+    FILE *in = fopen(job->source, "rb");
+    if (!in) return -1;
+    int fd = reserve_partial(partial, sizeof partial, dest);
+    FILE *out = fd >= 0 ? fdopen(fd, "wb") : NULL;
+    int ok = 0;
+    if (out) {
+        char buf[65536];
+        size_t n;
+        ok = 1;
+        while ((n = fread(buf, 1, sizeof buf, in)) > 0) {
+            if (fwrite(buf, 1, n, out) != n) { ok = 0; break; }
+        }
+        if (ferror(in) || fflush(out) != 0) ok = 0;
+#ifdef SHIYING_WIN
+        if (ok && _commit(fd) != 0) ok = 0;
+#else
+        if (ok && fsync(fd) != 0) ok = 0;
+#endif
+        if (fclose(out) != 0) ok = 0;
+    } else if (fd >= 0) close(fd);
+    fclose(in);
+    if (ok) {
+        const char *dot = strrchr(base, '.');
+        if (!dot) dot = base + strlen(base);
+        for (unsigned i = 1; i < 100; i++) {
+            int result = publish_file(partial, dest);
+            if (result == 0) return 0;
+            if (result < 0) break;
+            len = snprintf(dest, sizeof dest, "%s/%.*s_%u%s", job->desktop, (int)(dot - base), base, i + 1, dot);
+            if (len < 0 || (size_t)len >= sizeof dest) break;
+        }
+    }
+    if (partial[0]) unlink(partial);
+    return -1;
+}
+
+#ifdef SHIYING_WIN
+static unsigned __stdcall backup_worker(void *arg) {
+#else
+static void *backup_worker(void *arg) {
+#endif
+    BackupJob *job = arg;
+    job->failed = backup_copy(job) != 0;
+    atomic_store(&job->done, 1);
+    return 0;
+}
+
+static void backup_warn(SySession *s) {
+    const char *text = "桌面副本保存失败，录屏原件已保存";
+    if (!strstr(s->warn, text)) {
+        size_t used = strlen(s->warn);
+        snprintf(s->warn + used, sizeof s->warn - used, "%s%s", used ? "；" : "", text);
+    }
+}
+
+static void backup_start(BackupJob *job) {
+#ifdef SHIYING_WIN
+    job->worker = _beginthreadex(NULL, 0, backup_worker, job, 0, NULL);
+    int failed = !job->worker;
+#else
+    int failed = pthread_create(&job->worker, NULL, backup_worker, job) != 0;
+#endif
+    if (failed) {
+        job->failed = 1;
+        atomic_store(&job->done, 2);
+    }
+}
+
+static void backup_poll(SySession *s, int wait) {
+    while (s->backup_first) {
+        BackupJob *job = s->backup_first;
+        int state = atomic_load(&job->done);
+        if (!state && !wait) return;
+        if (state != 2) {
+#ifdef SHIYING_WIN
+            HANDLE worker = (HANDLE)job->worker;
+            WaitForSingleObject(worker, INFINITE);
+            CloseHandle(worker);
+#else
+            pthread_join(job->worker, NULL);
+#endif
+        }
+        if (job->failed) {
+            backup_warn(s);
+            logf_("desktop copy failed: %s", job->source);
+        }
+        s->backup_first = job->next;
+        free(job);
+        if (s->backup_first) backup_start(s->backup_first);
+        else s->backup_last = NULL;
+    }
+}
+
+static void queue_backup(SySession *s, const char *source) {
+    if (!s->plan.desktop_copy) return;
+    BackupJob *job = calloc(1, sizeof *job);
+    if (!job || sy_desktop_dir(job->desktop, sizeof job->desktop) != 0) {
+        free(job);
+        backup_warn(s);
+        return;
+    }
+    atomic_init(&job->done, 0);
+    snprintf(job->source, sizeof job->source, "%s", source);
+    if (s->backup_last) s->backup_last->next = job;
+    else {
+        s->backup_first = job;
+        backup_start(job);
+    }
+    s->backup_last = job;
+}
+
 static void remember_seal(SySession *s, const char *dest, uint64_t bytes) {
     snprintf(s->last_file, sizeof s->last_file, "%s", dest);
     s->last_bytes = bytes;
     s->sealed_count++;
     s->last_dur = s->t_accum;
+    queue_backup(s, dest);
 }
 
 static int write_list_idx(SySession *s, const char *dest, const int *idx, int n) {
@@ -352,7 +560,7 @@ static int syi_seal_commit(const char *list, const char *dest) {
     snprintf(concat, sizeof concat, "%s/seal.concat", s->tmpdir);
     snprintf(s->partial, sizeof s->partial, "%s.partial", dest);
     snprintf(s->commit_dest, sizeof s->commit_dest, "%s", dest);
-    int nfiles = write_concat(s, list, concat);
+    int nfiles = write_concat(list, concat);
     if (nfiles <= 0) {
         if (!s->last_file[0] && !s->err[0]) snprintf(s->err, sizeof s->err, "没有录到有效画面");
         s->list_pending = 0;
@@ -454,6 +662,7 @@ static int start_piece(SySession *s) {
     int idx = s->seg_next;
     s->afilter[0] = 0;
     int pipe_audio = s->audio_on && plat_audio_pipe();
+    int fixed_fps = s->plan.fps == 60;
     double wall = 0;
 #ifndef SHIYING_WIN
     double mono = 0;
@@ -463,7 +672,13 @@ static int start_piece(SySession *s) {
 #endif
     ap(&a, s->ffmpeg);
     ap(&a, "-hide_banner"); ap(&a, "-loglevel"); ap(&a, "warning"); ap(&a, "-nostats");
-    if (plat_ts_wall()) ap(&a, "-copyts");
+    if (plat_ts_wall()) {
+        ap(&a, "-copyts");
+        if (fixed_fps) {
+            /* 先把 X11 的绝对时间戳换成相对时间，再做恒定帧率同步。 */
+            ap(&a, "-itsoffset"); apf(&a, "-%.6f", wall);
+        }
+    }
     ap(&a, "-thread_queue_size"); ap(&a, "16");
     ap(&a, "-probesize"); ap(&a, "32"); ap(&a, "-analyzeduration"); ap(&a, "0");
     plat_append_video(s, &a);
@@ -473,7 +688,7 @@ static int start_piece(SySession *s) {
     if (pipe_audio) {
         ap(&a, "-thread_queue_size"); ap(&a, "4096");
         ap(&a, "-probesize"); ap(&a, "32"); ap(&a, "-analyzeduration"); ap(&a, "0");
-        ap(&a, "-itsoffset"); apf(&a, "%.6f", wall);
+        if (!fixed_fps) { ap(&a, "-itsoffset"); apf(&a, "%.6f", wall); }
         ap(&a, "-f"); ap(&a, "s16le"); ap(&a, "-ar"); ap(&a, "48000"); ap(&a, "-ac"); ap(&a, "2");
         ap(&a, "-i"); ap(&a, "/proc/self/fd/3");
         if (pipe2(pfd, O_CLOEXEC) != 0) {
@@ -496,6 +711,11 @@ static int start_piece(SySession *s) {
     int q = s->plan.quality;
     if (q < 0 || q > 2) q = 1;
     int hevc = s->plan.codec == SY_H265;
+    if (fixed_fps) {
+        /* 保持输出时间基准为 60 FPS，采集跟不上时由 ffmpeg 补帧。 */
+        ap(&a, "-r"); ap(&a, "60");
+        ap(&a, "-fps_mode"); ap(&a, "cfr");
+    }
     ap(&a, "-c:v"); ap(&a, hevc ? "libx265" : "libx264");
     ap(&a, "-preset"); ap(&a, enc_row[q].preset);
     ap(&a, "-crf"); ap(&a, hevc ? enc_row[q].crf265 : enc_row[q].crf264);
@@ -505,7 +725,7 @@ static int start_piece(SySession *s) {
     if (hevc) { ap(&a, "-x265-params"); ap(&a, X265P); }
     else { ap(&a, "-x264-params"); ap(&a, X264P); }
     if (s->audio_on) { ap(&a, "-c:a"); ap(&a, "aac"); ap(&a, "-b:a"); ap(&a, "128k"); }
-    if (plat_ts_wall()) { ap(&a, "-output_ts_offset"); apf(&a, "-%.6f", wall); }
+    if (plat_ts_wall() && !fixed_fps) { ap(&a, "-output_ts_offset"); apf(&a, "-%.6f", wall); }
     ap(&a, "-cluster_time_limit"); ap(&a, "2000");
     ap(&a, "-flush_packets"); ap(&a, "1");
     ap(&a, "-f"); ap(&a, "matroska"); ap(&a, "-y");
@@ -525,6 +745,7 @@ static int start_piece(SySession *s) {
         return -1;
     }
     s->live_pid = pid;
+    s->live_start_failed = 0;
     s->seg_next = idx + 1;
     s->t_seg = now_s();
 #ifndef SHIYING_WIN
@@ -608,9 +829,11 @@ static void finish_pause_flush(SySession *s) {
 
 static void on_live_exit(SySession *s, int code) {
     double ran = now_s() - s->t_seg;
-    if (ran > 0) s->t_accum += ran;
     uint64_t sz = s->seg_next > 0 ? seg_size(s, s->seg_next - 1) : 0;
-    if (sz >= 2048) s->media_ok = 1;
+    if (sz >= 2048) {
+        if (ran > 0) s->t_accum += ran;
+        s->media_ok = 1;
+    }
     logf_("segment exited unexpectedly code=%d ran=%.1fs", code, ran);
     mix_end(s);
     if (!s->media_ok && plat_fallback(s, sz)) {
@@ -637,7 +860,7 @@ static void on_slot_empty(SySession *s) {
             if (n > 0) {
                 char base[1200], dest[1200];
                 base[0] = 0;
-                read_target_file(s->tmpdir, base, sizeof base, NULL, NULL);
+                read_target_file(s->tmpdir, base, sizeof base, NULL, NULL, NULL);
                 if (!base[0]) dest_of(s, 1, base, sizeof base);
                 recover_name(base, dest, sizeof dest);
                 s->list_path[0] = 0;
@@ -689,7 +912,7 @@ static double elapsed_of(const SySession *s) {
 static void fill_status(const SySession *s, SyStatus *st) {
     memset(st, 0, sizeof *st);
     if (!s) return;
-    st->phase = s->phase;
+    st->phase = s->phase == SY_PHASE_IDLE && s->backup_first ? SY_PHASE_SEALING : s->phase;
     st->hold = s->hold;
     st->elapsed = elapsed_of(s);
     st->sealed_count = s->sealed_count;
@@ -844,6 +1067,7 @@ int sy_probe(const char *ffmpeg, SyCaps *out) {
     if (ff_capture(ffmpeg, "-encoders", buf, 512 * 1024) != 0) { free(buf); return -1; }
     out->h264 = has_tok(buf, "libx264");
     out->h265 = has_tok(buf, "libx265");
+    out->png = has_tok(buf, "png");
     if (ff_capture(ffmpeg, "-formats", buf, 512 * 1024) == 0) {
         out->mp4 = has_tok(buf, "mp4");
         out->mkv = has_tok(buf, "matroska");
@@ -861,6 +1085,208 @@ int sy_probe(const char *ffmpeg, SyCaps *out) {
     cc = *out;
     have = 1;
     return 0;
+}
+
+/* 单帧输出与录屏使用相同的采集路径，保留区域的实际像素尺寸。 */
+int sy_shot_begin(SyShot **out, const SyPlan *plan, const char *ffmpeg,
+                  const SyCaps *caps, SyStatus *st) {
+    if (out) *out = NULL;
+    if (!st) return SY_ERR_FFMPEG;
+    memset(st, 0, sizeof *st);
+    if (!out || !plan || !ffmpeg || !ffmpeg[0]) {
+        snprintf(st->err, sizeof st->err, "找不到截图引擎");
+        return SY_ERR_FFMPEG;
+    }
+    if (live_sess) {
+        snprintf(st->err, sizeof st->err, "请先结束录制");
+        return SY_ERR_BUSY;
+    }
+    if (plan->w < 1 || plan->h < 1) {
+        snprintf(st->err, sizeof st->err, "截图区域无效");
+        return SY_ERR_REGION;
+    }
+    if (caps && !caps->png) {
+        snprintf(st->err, sizeof st->err, "当前引擎没有 PNG 编码支持");
+        return SY_ERR_CODEC;
+    }
+    if (mkdir_p(plan->outdir) != 0) {
+        snprintf(st->err, sizeof st->err, "截图保存目录不可写");
+        return SY_ERR_DIR;
+    }
+    SySession capture = {0};
+    capture.plan = *plan;
+    capture.plan.fps = 30;
+    capture.plan.cursor = SY_CURSOR_OFF;
+#ifdef SHIYING_WIN
+    capture.grab = GRAB_GDI;
+    if (caps && !caps->grab_gdi) {
+        if (caps->grab_dda && full_monitor(&capture) >= 0) plat_take_begin(&capture);
+        else {
+            snprintf(st->err, sizeof st->err, "当前引擎无法截取所选范围");
+            return SY_ERR_REGION;
+        }
+    }
+#else
+    if (caps && !caps->grab_x11) {
+        snprintf(st->err, sizeof st->err, "当前引擎没有 X11 截图支持");
+        return SY_ERR_FFMPEG;
+    }
+#endif
+    SyShot *shot = calloc(1, sizeof *shot);
+    if (!shot) return SY_ERR_FFMPEG;
+    char stamp[32];
+    path_stamp(stamp, sizeof stamp);
+    snprintf(shot->dest, sizeof shot->dest, "%s/截图_%s.png", plan->outdir, stamp);
+    int fd = reserve_partial(shot->partial, sizeof shot->partial, shot->dest);
+    if (fd < 0) {
+        snprintf(st->err, sizeof st->err, "无法创建截图文件");
+        sy_shot_close(shot);
+        return SY_ERR_DIR;
+    }
+    close(fd);
+    if (plan->thumbnail) {
+        char path[1240];
+        snprintf(path, sizeof path, "%s.preview", shot->dest);
+        fd = reserve_partial(shot->preview, sizeof shot->preview, path);
+        if (fd >= 0) {
+            close(fd);
+            shot->preview_w = plan->w < 180 ? plan->w : 180;
+            shot->preview_h = (int)((int64_t)plan->h * shot->preview_w / plan->w);
+            if (shot->preview_h > 104) {
+                shot->preview_h = 104;
+                shot->preview_w = (int)((int64_t)plan->w * 104 / plan->h);
+            }
+            if (shot->preview_w < 1) shot->preview_w = 1;
+            if (shot->preview_h < 1) shot->preview_h = 1;
+        }
+    }
+    ArgBuf a = {0};
+    ap(&a, ffmpeg);
+    ap(&a, "-hide_banner"); ap(&a, "-loglevel"); ap(&a, "error");
+    ap(&a, "-nostdin"); ap(&a, "-y");
+    plat_append_video(&capture, &a);
+    ap(&a, "-map"); ap(&a, "0:v:0");
+    ap(&a, "-frames:v"); ap(&a, "1");
+    ap(&a, "-c:v"); ap(&a, "png");
+    ap(&a, "-pix_fmt"); ap(&a, "rgb24");
+    ap(&a, "-f"); ap(&a, "image2");
+    ap(&a, "-update"); ap(&a, "1");
+    ap(&a, shot->partial);
+    if (shot->preview[0]) {
+        ap(&a, "-map"); ap(&a, "0:v:0");
+        ap(&a, "-frames:v"); ap(&a, "1");
+        ap(&a, "-vf"); apf(&a, "scale=%d:%d:flags=bilinear", shot->preview_w, shot->preview_h);
+        ap(&a, "-c:v"); ap(&a, "rawvideo");
+        ap(&a, "-threads:v"); ap(&a, "1");
+        ap(&a, "-pix_fmt"); ap(&a, "bgra");
+        ap(&a, "-f"); ap(&a, "rawvideo"); ap(&a, shot->preview);
+    }
+    char *av[ARG_N + 1];
+    for (int i = 0; i < a.n; i++) av[i] = a.b[i];
+    av[a.n] = NULL;
+    shot->pid = plat_spawn(av, -1, 0);
+    if (shot->pid < 0) {
+        snprintf(st->err, sizeof st->err, "无法启动截图引擎");
+        sy_shot_close(shot);
+        return SY_ERR_FFMPEG;
+    }
+    shot->started = now_s();
+    *out = shot;
+    return SY_OK;
+}
+
+static int publish_shot(SyShot *shot) {
+    char stem[1200];
+    snprintf(stem, sizeof stem, "%s", shot->dest);
+    char *ext = strrchr(stem, '.');
+    if (ext) *ext = 0;
+    for (unsigned i = 1; i < 100; i++) {
+        int result = publish_file(shot->partial, shot->dest);
+        if (result != 1) return result;
+        int len = snprintf(shot->dest, sizeof shot->dest, "%s_%02u.png", stem, i + 1);
+        if (len < 0 || (size_t)len >= sizeof shot->dest) break;
+    }
+    return -1;
+}
+
+static void read_shot_preview(SyShot *shot) {
+    FILE *f = fopen(shot->preview, "rb");
+    if (!f) return;
+    size_t len = (size_t)shot->preview_w * shot->preview_h * 4;
+    unsigned char *data = malloc(len);
+    if (data && fread(data, 1, len, f) == len) {
+        for (size_t i = 3; i < len; i += 4) data[i] = 255;
+        shot->pixels = data;
+    } else free(data);
+    fclose(f);
+}
+
+static int shot_png_complete(const char *path) {
+    static const unsigned char magic[] = { 137, 80, 78, 71, 13, 10, 26, 10 };
+    static const unsigned char end[] = { 0, 0, 0, 0, 'I', 'E', 'N', 'D', 174, 66, 96, 130 };
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    unsigned char chunk[sizeof end];
+    int valid = fread(chunk, 1, sizeof magic, f) == sizeof magic
+        && memcmp(chunk, magic, sizeof magic) == 0
+        && fseek(f, -(long)sizeof end, SEEK_END) == 0
+        && fread(chunk, 1, sizeof end, f) == sizeof end
+        && memcmp(chunk, end, sizeof end) == 0;
+    fclose(f);
+    return valid;
+}
+
+int sy_shot_poll(SyShot *shot, SyStatus *st) {
+    if (!shot || !st) return 1;
+    if (!shot->done) {
+        int code = 1;
+        if (!plat_reap(shot->pid, &code)) {
+            if (now_s() - shot->started > 12) plat_kill(shot->pid);
+            return 0;
+        }
+        shot->pid = 0;
+        shot->done = 1;
+        struct stat info;
+        if (stat(shot->partial, &info) == 0 && shot_png_complete(shot->partial)
+            && path_fsync(shot->partial) == 0 && publish_shot(shot) == 0) {
+            shot->status.last_bytes = (uint64_t)info.st_size;
+            snprintf(shot->status.last_file, sizeof shot->status.last_file, "%s", shot->dest);
+            if (shot->preview[0]) read_shot_preview(shot);
+        } else {
+            char detail[300] = "";
+            if (code != 0) log_tail(detail, sizeof detail);
+            snprintf(shot->status.err, sizeof shot->status.err, "截图保存失败%s%s",
+                     detail[0] ? "：" : "", detail);
+        }
+        unlink(shot->partial);
+        if (shot->preview[0]) unlink(shot->preview);
+    }
+    *st = shot->status;
+    return 1;
+}
+
+const unsigned char *sy_shot_preview(const SyShot *shot, int *w, int *h) {
+    if (w) *w = shot && shot->pixels ? shot->preview_w : 0;
+    if (h) *h = shot && shot->pixels ? shot->preview_h : 0;
+    return shot ? shot->pixels : NULL;
+}
+
+void sy_shot_close(SyShot *shot) {
+    if (!shot) return;
+    if (shot->pid > 0) {
+        plat_kill(shot->pid);
+#ifdef SHIYING_WIN
+        HANDLE worker = find_proc(shot->pid);
+        if (worker) WaitForSingleObject(worker, INFINITE);
+        plat_reap(shot->pid, NULL);
+#else
+        while (waitpid((pid_t)shot->pid, NULL, 0) < 0 && errno == EINTR) {}
+#endif
+    }
+    if (shot->partial[0]) unlink(shot->partial);
+    if (shot->preview[0]) unlink(shot->preview);
+    free(shot->pixels);
+    free(shot);
 }
 
 int sy_devices(SyDevice *out, int cap) { return plat_devices(out, cap); }
@@ -958,7 +1384,8 @@ int sy_session_open(SySession **out, const SyPlan *plan, const char *ffmpeg,
         free(s);
         return SY_ERR_REGION;
     }
-    if (s->plan.fps != 10 && s->plan.fps != 15 && s->plan.fps != 24 && s->plan.fps != 30) s->plan.fps = 24;
+    if (s->plan.fps != 10 && s->plan.fps != 15 && s->plan.fps != 24
+        && s->plan.fps != 30 && s->plan.fps != 60) s->plan.fps = 24;
     if (s->plan.quality < 0 || s->plan.quality > 2) s->plan.quality = 1;
     if (mkdir_p(s->plan.outdir) != 0 || access(s->plan.outdir, W_OK) != 0) {
         snprintf(st->err, sizeof st->err, "保存目录不可写：%s", s->plan.outdir);
@@ -1007,7 +1434,7 @@ int sy_session_open(SySession **out, const SyPlan *plan, const char *ffmpeg,
     char lp[1200];
     snprintf(lp, sizeof lp, "%s/ffmpeg.log", g_cache_dir);
     FILE *lf = fopen(lp, "w");
-    if (lf) { fprintf(lf, "# 拾影录屏 %s 录制日志\n", APP_VERSION); fclose(lf); }
+    if (lf) { fprintf(lf, "# " APP_NAME " %s 录制日志\n", APP_VERSION); fclose(lf); }
     s->audio_on = s->plan.audio != SY_AUDIO_SILENCE;
 #ifndef SHIYING_WIN
     if (s->audio_on) {
@@ -1061,13 +1488,27 @@ void sy_session_stop(SySession *s) {
 }
 
 void sy_session_poll(SySession *s) {
-    if (!s || s->phase == SY_PHASE_IDLE) return;
+    if (!s) return;
+    backup_poll(s, 0);
+    if (s->phase == SY_PHASE_IDLE) return;
     if (s->slot_pid && s->slot_kind == SLOT_FLUSH && !s->slot_killed && now_s() - s->slot_since > 12) {
         plat_kill(s->slot_pid);
         s->slot_killed = 1;
         logf_("segment pid=%d killed after timeout", s->slot_pid);
     }
-    if (s->live_pid && s->seg_next > 0 && seg_size(s, s->seg_next - 1) >= 2048) s->media_ok = 1;
+    if (s->live_pid && s->seg_next > 0) {
+        uint64_t bytes = seg_size(s, s->seg_next - 1);
+        if (bytes >= 2048) s->media_ok = 1;
+#ifdef SHIYING_WIN
+        /* 桌面复制可能一直等不到首帧，例如远程或锁定的桌面。 */
+        else if (s->grab == GRAB_DDA && !s->media_ok && !bytes && !s->live_start_failed
+                 && s->hold == SY_HOLD_NONE && now_s() - s->t_seg > 3) {
+            s->live_start_failed = 1;
+            logf_("Desktop Duplication did not produce a first frame");
+            plat_kill(s->live_pid);
+        }
+#endif
+    }
     int live_exit = 0, slot_exit = 0, live_code = 0, slot_code = 0, kind = s->slot_kind;
     if (s->live_pid) {
         int c = 0, r = plat_reap(s->live_pid, &c);
@@ -1100,6 +1541,7 @@ void sy_session_close(SySession *s) {
     if (s->slot_pid) plat_kill(s->slot_pid);
     plat_cursor_off();
     mix_stop(s);
+    backup_poll(s, 1);
     if (live_sess == s) live_sess = NULL;
     free(s);
 }
@@ -1133,7 +1575,8 @@ int sy_recover(const char *outdir, const char *ffmpeg, SySession **out, SyStatus
     int codec = SY_H264, container = SY_MP4;
     char dest[1200];
     dest[0] = 0;
-    read_target_file(found, dest, sizeof dest, &codec, &container);
+    s->plan.desktop_copy = 1;
+    read_target_file(found, dest, sizeof dest, &codec, &container, &s->plan.desktop_copy);
     s->plan.codec = (SyCodec)codec;
     s->plan.container = (SyContainer)container;
     if (dest[0]) {

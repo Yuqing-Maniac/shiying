@@ -1,5 +1,5 @@
 #!/bin/bash
-# 拾影录屏 回归测试（无头：Xvfb＋PulseAudio 空设备，x86_64 宿主）
+# 映刻录屏 回归测试（无头：Xvfb＋PulseAudio 空设备，x86_64 宿主）
 # 写于 2026-10-22，把开发期间手工执行过的检查固化成脚本；原始的手工测试脚本保留在 tests/manual/。
 # 用法：bash tests/run_tests.sh          需先 bash build/build_all.sh（或至少 fetch_deps.sh＋build.sh x86_64）
 # 覆盖：自检、单实例命令转发、录制／暂停／继续／停止、音画同步、两路混音、异常中断恢复、引擎禁止执行时自动复制、
@@ -9,7 +9,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WORK="${SY_WORK:-$ROOT/_work}"
 T="$WORK/test"; rm -rf "$T"; mkdir -p "$T"
 APP="$T/app"; mkdir -p "$APP/录制引擎"
-cp "$WORK/build/x86_64/shiying" "$APP/拾影录屏" && cp "$WORK/vendor/ffmpeg-x86_64" "$APP/录制引擎/ffmpeg" || { echo "缺少构建产物，先运行 build/build_all.sh"; exit 2; }
+cp "$WORK/build/x86_64/shiying" "$APP/映刻录屏" && cp "$WORK/vendor/ffmpeg-x86_64" "$APP/录制引擎/ffmpeg" || { echo "缺少构建产物，先运行 build/build_all.sh"; exit 2; }
 FF="$APP/录制引擎/ffmpeg"
 PASS=0; FAIL=0
 ok()  { echo "  [通过] $*"; PASS=$((PASS+1)); }
@@ -42,7 +42,7 @@ while True:
 PY
 FLICKERPID=""
 REDPID=""
-cleanup() { pkill -f "$APP/拾影录屏" 2>/dev/null; [ -n "$FLICKERPID" ] && kill "$FLICKERPID" 2>/dev/null; [ -n "$REDPID" ] && kill "$REDPID" 2>/dev/null; kill $MICPID $XPID 2>/dev/null; pulseaudio --kill 2>/dev/null; }
+cleanup() { pkill -f "$APP/映刻录屏" 2>/dev/null; [ -n "$FLICKERPID" ] && kill "$FLICKERPID" 2>/dev/null; [ -n "$REDPID" ] && kill "$REDPID" 2>/dev/null; kill $MICPID $XPID 2>/dev/null; pulseaudio --kill 2>/dev/null; }
 trap cleanup EXIT
 CONF="$HOME/.config/shiying"; mkdir -p "$CONF"
 setcfg() { printf 'area=0\nmonitor=-1\naudio=%s\nfps=24\nquality=1\nscale=0\nformat=%s\ncountdown=0\nmouse=1\noutdir=%s\n' "$1" "$2" "$HOME/视频/录屏" > "$CONF/config.ini"; }
@@ -53,23 +53,23 @@ OUTD="$HOME/视频/录屏"
 latest() { ls -t "$OUTD"/*.m* 2>/dev/null | head -1; }
 dur() { "$FF" -hide_banner -i "$1" 2>&1 | sed -n 's/.*Duration: \([0-9:.]*\).*/\1/p' | awk -F: '{print $1*3600+$2*60+$3}'; }
 streams() { "$FF" -hide_banner -i "$1" 2>&1 | grep -c "Stream #"; }
-start_app() { ("$APP/拾影录屏" >/dev/null 2>&1 &); sleep 1.5; }
-stop_app() { "$APP/拾影录屏" --quit; sleep 1; pkill -f "$APP/拾影录屏" 2>/dev/null; sleep 0.3; }
+start_app() { ("$APP/映刻录屏" >/dev/null 2>&1 &); sleep 1.5; }
+stop_app() { "$APP/映刻录屏" --quit; sleep 1; pkill -f "$APP/映刻录屏" 2>/dev/null; sleep 0.3; }
 
 echo "== 1. 自检"
 setcfg 3 0
-"$APP/拾影录屏" --check > "$T/check.txt" 2>&1
+"$APP/映刻录屏" --check > "$T/check.txt" 2>&1
 chk "--check 全部通过" "grep -q '自检通过' '$T/check.txt'"
 chk "从中文路径定位录制引擎" "grep -q '录制引擎/ffmpeg' '$T/check.txt'"
 
 echo "== 2. 录制、暂停、继续、停止（两路声音、MP4）"
 start_app
-chk "单实例：第二次启动不再新开进程" "\"$APP/拾影录屏\" --show; sleep 0.5; [ \$(pgrep -fc \"$APP/拾影录屏\") -eq 1 ]"
+chk "单实例：第二次启动不再新开进程" "\"$APP/映刻录屏\" --show; sleep 0.5; [ \$(pgrep -fc \"$APP/映刻录屏\") -eq 1 ]"
 pactl load-module module-sine sink=speaker frequency=440 >/dev/null
-"$APP/拾影录屏" --toggle; sleep 3
-"$APP/拾影录屏" --pause; sleep 1.5
-"$APP/拾影录屏" --pause; sleep 3
-"$APP/拾影录屏" --toggle; sleep 4
+"$APP/映刻录屏" --toggle; sleep 3
+"$APP/映刻录屏" --pause; sleep 1.5
+"$APP/映刻录屏" --pause; sleep 3
+"$APP/映刻录屏" --toggle; sleep 4
 pactl unload-module module-sine 2>/dev/null
 F=$(latest)
 chk "生成 mp4 文件" "[ -n '$F' ] && [[ '$F' == *.mp4 ]]"
@@ -91,9 +91,9 @@ echo "== 3. 音画同步（屏幕变白与声音同时出现）"
 setcfg 1 1
 start_app
 which xsetroot >/dev/null && xsetroot -solid black
-"$APP/拾影录屏" --toggle; sleep 3
+"$APP/映刻录屏" --toggle; sleep 3
 xsetroot -solid white; pactl load-module module-sine sink=speaker frequency=440 >/dev/null; sleep 3
-"$APP/拾影录屏" --toggle; sleep 4
+"$APP/映刻录屏" --toggle; sleep 4
 pactl unload-module module-sine 2>/dev/null; xsetroot -solid black
 F=$(latest)
 python3 - "$FF" "$F" > "$T/sync.txt" <<'PY'
@@ -116,8 +116,8 @@ stop_app
 echo "== 4. 异常中断后自动恢复"
 setcfg 0 0
 start_app
-"$APP/拾影录屏" --toggle; sleep 6
-pkill -9 -f "$APP/拾影录屏"; sleep 1
+"$APP/映刻录屏" --toggle; sleep 6
+pkill -9 -f "$APP/映刻录屏"; sleep 1
 chk "中断后留下临时分段目录" "ls -d '$OUTD'/.shiying-* >/dev/null 2>&1"
 start_app; sleep 3
 F=$(latest)
@@ -128,7 +128,7 @@ stop_app
 
 echo "== 5. 引擎无执行权限时自动复制到缓存目录"
 chmod -x "$FF"
-"$APP/拾影录屏" --check > "$T/check2.txt" 2>&1
+"$APP/映刻录屏" --check > "$T/check2.txt" 2>&1
 chk "改用 ~/.cache/shiying/ffmpeg" "grep -q '.cache/shiying/ffmpeg' '$T/check2.txt'"
 chmod +x "$FF"
 
@@ -166,7 +166,7 @@ sleep 0.3
 stop_app
 start_app
 MARK=$(wc -l < "$LOG" 2>/dev/null || echo 0)
-"$APP/拾影录屏" --toggle
+"$APP/映刻录屏" --toggle
 GOT=0
 for _i in $(seq 1 90); do
   N=$(awk -v s="${MARK:-0}" 'NR>s && /sealed / {c++} END{print c+0}' "$LOG" 2>/dev/null || echo 0)
@@ -179,7 +179,7 @@ F2=${SEALS[1]:-}
 D1=0; D2=0
 if [ -n "$F1" ] && [ -f "$F1" ]; then D1=$(dur "$F1"); fi
 if [ -n "$F2" ] && [ -f "$F2" ]; then D2=$(dur "$F2"); fi
-pkill -9 -f "$APP/拾影录屏" || true
+pkill -9 -f "$APP/映刻录屏" || true
 sleep 1
 chk "封存出两个文件" "[ '$GOT' = 1 ] && [ -n '$F1' ] && [ -n '$F2' ] && [ -f '$F1' ] && [ -f '$F2' ] && [ '$F1' != '$F2' ]"
 chk "两段都有时长（$D1，$D2）" "python3 -c 'import sys; sys.exit(0 if float(\"${D1:-0}\") > 0.05 and float(\"${D2:-0}\") > 0.05 else 1)'"
@@ -200,9 +200,9 @@ short_take() {
   stop_app
   writecfg "$out" "$audio" 0 "$cursor" "$codec" 0 0 0
   start_app
-  "$APP/拾影录屏" --toggle
+  "$APP/映刻录屏" --toggle
   sleep 2
-  "$APP/拾影录屏" --toggle
+  "$APP/映刻录屏" --toggle
   sleep "$settle"
   local f d v
   f=$(ls -t "$out"/*.m* 2>/dev/null | head -1 || true)
@@ -276,9 +276,9 @@ pix_take() {
   stop_app
   writecfg "$out" 0 0 "$cursor" 0 0 0 2
   start_app
-  "$APP/拾影录屏" --toggle
+  "$APP/映刻录屏" --toggle
   sleep 2
-  "$APP/拾影录屏" --toggle
+  "$APP/映刻录屏" --toggle
   sleep 4
   local f counts red n
   f=$(ls -t "$out"/*.m* 2>/dev/null | head -1 || true)
@@ -306,9 +306,9 @@ echo "== 8. 发布包"
 DIST="$WORK/dist"
 if ls "$DIST"/*.deb >/dev/null 2>&1; then
   for A in 飞腾arm64 x86_64; do
-    TG=$(ls "$DIST"/拾影录屏_*_${A}_免安装.tar.gz)
+    TG=$(ls "$DIST"/映刻录屏_*_${A}_免安装.tar.gz)
     chk "$A 免安装包无符号链接" "! tar -tvzf '$TG' | grep -q '^l'"
-    chk "$A 免安装包文件齐全" "[ \$(tar -tzf '$TG' | grep -cE '拾影录屏/(拾影录屏|录制引擎/ffmpeg|使用说明.txt|安装到菜单.sh|卸载.sh)$') -eq 5 ]"
+    chk "$A 免安装包文件齐全" "[ \$(tar -tzf '$TG' | grep -cE '映刻录屏/(映刻录屏|录制引擎/ffmpeg|使用说明.txt|安装到菜单.sh|卸载.sh)$') -eq 5 ]"
   done
   chk "arm64 deb 架构字段" "dpkg-deb -f \"\$(ls '$DIST'/*飞腾arm64_安装包.deb)\" Architecture | grep -qx arm64"
   chk "校验值文件与包一致" "(cd '$DIST' && sha256sum -c --quiet 校验值.txt)"

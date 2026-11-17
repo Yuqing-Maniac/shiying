@@ -10,10 +10,10 @@ DIST="${1:-$WORK/dist}"; OUT="${2:-$WORK/assets}"
 [ -d "$DIST" ] || { echo "缺少发布目录 $DIST，先运行 build/release.sh" >&2; exit 1; }
 rm -rf "$OUT"; mkdir -p "$OUT"; : > "$OUT/upload.list"
 N=0
-for f in "$DIST"/拾影录屏_*; do
+for f in "$DIST"/映刻录屏_*; do
   [ -f "$f" ] || continue
   zh=$(basename "$f")
-  rest=${zh#拾影录屏_}; ver=${rest%%_*}; rest=${rest#*_}
+  rest=${zh#映刻录屏_}; ver=${rest%%_*}; rest=${rest#*_}
   case "$rest" in
     飞腾arm64_*) a=kylin_arm64; rest=${rest#飞腾arm64_} ;;
     x86_64_*) a=linux_x86_64; rest=${rest#x86_64_} ;;

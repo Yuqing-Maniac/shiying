@@ -2,13 +2,20 @@
 #define SHIYING_CFG_H
 
 #include "session.h"
+#include "toolbar.h"
 
-enum { AREA_SCREEN = 0, AREA_REGION = 1 };
+enum { AREA_SCREEN = 0, AREA_REGION = 1, AREA_WINDOW = 2 };
 
 typedef struct {
     int area;
+    int mode;
     int monitor;
     int rx, ry, rw, rh;
+    int remember_selection;
+    int desktop_copy;
+    int show_thumbnail;
+    int click_highlight;
+    int theme;
     int audio;
     int fps;
     int quality;
